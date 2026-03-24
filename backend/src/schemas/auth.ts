@@ -9,6 +9,7 @@ export const registerSchema = z.object({
     .string()
     .min(2, "Name must be at least 2 characters long")
     .max(100, "Name must be less than 100 characters"),
+  role: z.enum(["CLIENT", "FREELANCER"]).default("FREELANCER"),
 });
 
 export const loginSchema = z.object({

@@ -55,6 +55,7 @@ router.post(
    *                 password: password123
    *                 stellarAddress: GABCD123...
    *                 name: John Doe
+   *                 role: FREELANCER
    *     responses:
    *       201:
    *         description: User registered successfully
@@ -103,7 +104,7 @@ router.post(
   "/register",
   validate({ body: registerSchema }),
   asyncHandler(async (req: Request, res: Response) => {
-    const { stellarAddress, email, name, password } = req.body;
+    const { stellarAddress, email, name, password, role } = req.body;
 
     const existingUser = await prisma.user.findFirst({
       where: {
@@ -127,7 +128,7 @@ router.post(
         email,
         username: name,
         password: hashedPassword,
-        role: "FREELANCER",
+        role: role ?? "FREELANCER",
       },
     });
 

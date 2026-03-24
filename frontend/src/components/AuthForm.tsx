@@ -93,6 +93,7 @@ export default function AuthForm({ type }: AuthFormProps) {
             email: formData.email,
             password: formData.password,
             stellarAddress: address,
+            role: formData.role,
           }),
         });
 
