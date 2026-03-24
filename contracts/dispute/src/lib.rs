@@ -536,22 +536,19 @@ impl DisputeContract {
             return Err(DisputeError::VotingClosed);
         }
 
-        // Parties involved cannot vote
+        // Participants cannot vote in their own dispute
         if voter == dispute.client || voter == dispute.freelancer {
-            return Err(DisputeError::InvalidParty);
+            return Err(DisputeError::Unauthorized);
         }
 
-        // Check if voter is excluded due to conflict of interest
-        if dispute.excluded_voters.contains(&voter) {
-            return Err(DisputeError::ConflictOfInterest);
+        // Check excluded voters list
+        if Self::is_excluded_voter(env.clone(), dispute_id, voter.clone()) {
+            return Err(DisputeError::Unauthorized);
         }
 
-        // Check voter reputation eligibility (only if reputation system is initialized)
-        if env.storage().instance().has(&DataKey::ReputationContract) {
-            let is_eligible = Self::is_eligible_voter(env.clone(), voter.clone())?;
-            if !is_eligible {
-                return Err(DisputeError::InsufficientReputation);
-            }
+        // Enforce minimum reputation
+        if !Self::is_eligible_voter(env.clone(), voter.clone())? {
+            return Err(DisputeError::InsufficientReputation);
         }
 
         // Check if already voted
