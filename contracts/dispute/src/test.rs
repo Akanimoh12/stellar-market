@@ -581,6 +581,43 @@ fn test_tie_break_default_refund_both() {
     assert_eq!(status, DisputeStatus::RefundedBoth);
 }
 
+// ── Graceful degradation without reputation system ────────────────────────────
+
+#[test]
+fn test_vote_without_reputation_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+
+    let user_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    // Raise a dispute WITHOUT calling initialize (no reputation contract)
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &user_client,
+        &freelancer,
+        &user_client,
+        &String::from_str(&env, "Issue"),
+        &3u32,
+        &None,
+    );
+
+    // Voting should succeed — reputation check is skipped when not configured
+    let voter = Address::generate(&env);
+    client.cast_vote(
+        &dispute_id,
+        &voter,
+        &VoteChoice::Client,
+        &String::from_str(&env, "Reason"),
+    );
+
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.votes_for_client, 1);
+}
+
 // ── Pause mechanism tests ─────────────────────────────────────────────────────
 
 #[test]

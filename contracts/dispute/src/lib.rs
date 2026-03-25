@@ -442,6 +442,7 @@ impl DisputeContract {
     }
 
     /// Raise a dispute on a job. Either the client or freelancer can initiate.
+    #[allow(clippy::too_many_arguments)]
     pub fn raise_dispute(
         env: Env,
         job_id: u64,
@@ -514,7 +515,9 @@ impl DisputeContract {
     }
 
     /// Cast a vote on a dispute. Voters cannot be the client or freelancer.
-    /// Voters must have sufficient reputation to participate (if reputation system is initialized).
+    /// If the reputation system is initialized, voters must meet the minimum
+    /// reputation threshold. When no reputation contract is configured, voting
+    /// proceeds without a reputation check to allow graceful degradation.
     pub fn cast_vote(
         env: Env,
         dispute_id: u64,
@@ -536,19 +539,22 @@ impl DisputeContract {
             return Err(DisputeError::VotingClosed);
         }
 
-        // Participants cannot vote in their own dispute
+        // Parties involved cannot vote
         if voter == dispute.client || voter == dispute.freelancer {
-            return Err(DisputeError::Unauthorized);
+            return Err(DisputeError::InvalidParty);
         }
 
-        // Check excluded voters list
-        if Self::is_excluded_voter(env.clone(), dispute_id, voter.clone()) {
-            return Err(DisputeError::Unauthorized);
+        // Check if voter is excluded due to conflict of interest
+        if dispute.excluded_voters.contains(&voter) {
+            return Err(DisputeError::ConflictOfInterest);
         }
 
-        // Enforce minimum reputation
-        if !Self::is_eligible_voter(env.clone(), voter.clone())? {
-            return Err(DisputeError::InsufficientReputation);
+        // Check voter reputation eligibility (only if reputation system is initialized)
+        if env.storage().instance().has(&DataKey::ReputationContract) {
+            let is_eligible = Self::is_eligible_voter(env.clone(), voter.clone())?;
+            if !is_eligible {
+                return Err(DisputeError::InsufficientReputation);
+            }
         }
 
         // Check if already voted
@@ -652,7 +658,7 @@ impl DisputeContract {
         escrow: Address,
     ) -> Result<DisputeStatus, DisputeError> {
         require_not_paused(&env)?;
-        
+
         let mut dispute: Dispute = env
             .storage()
             .persistent()
