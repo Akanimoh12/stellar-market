@@ -1,5 +1,21 @@
-import { DisputeStatus, JobStatus } from "@prisma/client";
 import { DisputeService } from "../services/dispute.service";
+
+// Local runtime-friendly enums for tests (use string literals to avoid TS value/type mismatch
+// when importing generated Prisma types). This keeps tests stable and avoids relying on the
+// runtime shape of @prisma/client exports during TypeScript compile.
+const DisputeStatus = {
+  OPEN: "OPEN",
+  IN_PROGRESS: "IN_PROGRESS",
+  RESOLVED: "RESOLVED",
+} as const;
+
+const JobStatus = {
+  OPEN: "OPEN",
+  IN_PROGRESS: "IN_PROGRESS",
+  COMPLETED: "COMPLETED",
+  CANCELLED: "CANCELLED",
+  DISPUTED: "DISPUTED",
+} as const;
 
 // ─── Prisma mock ─────────────────────────────────────────────────────────────
 jest.mock("@prisma/client", () => {

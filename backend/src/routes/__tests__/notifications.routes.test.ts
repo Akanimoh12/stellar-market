@@ -65,6 +65,11 @@ function authHeader(userId = USER_TEST_ID) {
 
 afterEach(() => jest.clearAllMocks());
 
+beforeEach(() => {
+  // ensure auth middleware finds a user record by default
+  prismaMock.user.findUnique.mockResolvedValue({ id: USER_TEST_ID, role: "FREELANCER" });
+});
+
 describe("DELETE /api/notifications/:id", () => {
   it("deletes a notification and returns 204 (happy path)", async () => {
     const mockNotification = {
