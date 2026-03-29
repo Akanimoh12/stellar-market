@@ -38,6 +38,9 @@ export default function JobDetailPage() {
   const [extendingMilestoneId, setExtendingMilestoneId] = useState<string | null>(null);
   const [extendDeadlineDate, setExtendDeadlineDate] = useState<Record<string, string>>({});
   const [hasApplied, setHasApplied] = useState(false);
+  const [myApplicationId, setMyApplicationId] = useState<string | null>(null);
+  const [withdrawConfirmOpen, setWithdrawConfirmOpen] = useState(false);
+  const [withdrawing, setWithdrawing] = useState(false);
   const [applications, setApplications] = useState<Application[]>([]);
   const [loadingApps, setLoadingApps] = useState(false);
   const [actioningApp, setActioningApp] = useState<string | null>(null);
@@ -62,9 +65,14 @@ export default function JobDetailPage() {
               headers: { Authorization: `Bearer ${token}` },
             },
           );
-          setHasApplied(appsRes.data.total > 0);
+          const applied = appsRes.data.total > 0;
+          setHasApplied(applied);
+          if (applied && appsRes.data.data[0]) {
+            setMyApplicationId(appsRes.data.data[0].id);
+          }
         } catch {
           setHasApplied(false);
+          setMyApplicationId(null);
         }
       }
     } catch (err: unknown) {
@@ -120,6 +128,24 @@ export default function JobDetailPage() {
       );
     } finally {
       setActioningApp(null);
+    }
+  };
+
+  const handleWithdrawApplication = async () => {
+    if (!myApplicationId) return;
+    setWithdrawing(true);
+    try {
+      const token = localStorage.getItem("stellarmarket_jwt");
+      await axios.delete(`${API_URL}/applications/${myApplicationId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setHasApplied(false);
+      setMyApplicationId(null);
+      setWithdrawConfirmOpen(false);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Failed to withdraw application.");
+    } finally {
+      setWithdrawing(false);
     }
   };
 
@@ -607,12 +633,17 @@ export default function JobDetailPage() {
             {/* Apply section — freelancers only, non-owners */}
             {user?.role === "FREELANCER" && !isOwnJob && job.status === "OPEN" && (
               hasApplied ? (
-                <button
-                  className="btn-secondary w-full flex items-center justify-center gap-2 cursor-default opacity-80"
-                  disabled
-                >
-                  <CheckCircle size={16} /> Applied
-                </button>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-center gap-2 w-full py-2 px-4 rounded-lg bg-green-500/10 text-green-400 text-sm font-medium border border-green-500/20">
+                    <CheckCircle size={16} /> Applied
+                  </div>
+                  <button
+                    className="btn-secondary w-full flex items-center justify-center gap-2 border-theme-error text-theme-error hover:bg-theme-error/10 text-sm"
+                    onClick={() => setWithdrawConfirmOpen(true)}
+                  >
+                    Withdraw Application
+                  </button>
+                </div>
               ) : (
                 <button
                   className="btn-primary w-full"
@@ -716,6 +747,41 @@ export default function JobDetailPage() {
             await handleRevisionEscrow("propose", milestones);
           }}
         />
+      )}
+
+      {/* Withdraw Application confirmation dialog */}
+      {withdrawConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
+            <h2 className="text-lg font-semibold text-theme-heading mb-2">
+              Withdraw Application?
+            </h2>
+            <p className="text-sm text-theme-text mb-6">
+              Are you sure you want to withdraw your application for{" "}
+              <span className="font-medium text-theme-heading">{job.title}</span>?
+              This cannot be undone.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setWithdrawConfirmOpen(false)}
+                className="btn-secondary"
+                disabled={withdrawing}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void handleWithdrawApplication()}
+                disabled={withdrawing}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-theme-error text-white text-sm font-medium hover:bg-theme-error/90 transition-colors disabled:opacity-50"
+              >
+                {withdrawing ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : null}
+                Withdraw
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

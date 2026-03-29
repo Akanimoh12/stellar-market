@@ -1,10 +1,11 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { Search } from "lucide-react";
+import { Search, LayoutGrid } from "lucide-react";
 import axios from "axios";
 import ServiceCard from "@/components/ServiceCard";
 import Pagination from "@/components/Pagination";
+import EmptyState from "@/components/EmptyState";
 import { ServiceListing, PaginatedResponse } from "@/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
@@ -129,15 +130,25 @@ export default function ServicesPage() {
           />
         </>
       ) : (
-        <div className="text-center py-20">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-theme-card border border-theme-border mb-4">
-            <Search className="text-theme-text" size={32} />
-          </div>
-          <h3 className="text-xl font-semibold text-theme-heading mb-2">No services found</h3>
-          <p className="text-theme-text max-w-xs mx-auto">
-            Try adjusting your search filters or browse other categories.
-          </p>
-        </div>
+        <EmptyState
+          icon={LayoutGrid}
+          title={
+            search || selectedCategory !== "All"
+              ? "No services match your search."
+              : "No services listed yet. Be the first!"
+          }
+          description={
+            search || selectedCategory !== "All"
+              ? "Try a different keyword or select another category."
+              : "Offer your skills to the Stellar community by posting a service."
+          }
+          action={{ label: "Post a Service", href: "/services/new" }}
+          secondaryAction={
+            search || selectedCategory !== "All"
+              ? { label: "Clear Search", onClick: () => { handleSearchChange(""); handleCategoryChange("All"); } }
+              : undefined
+          }
+        />
       )}
     </div>
   );

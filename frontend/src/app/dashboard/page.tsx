@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Briefcase,
   FileText,
@@ -8,9 +8,14 @@ import {
   Star,
   DollarSign,
   Loader2,
+  Trash2,
 } from "lucide-react";
+import axios from "axios";
 import StatusBadge from "@/components/StatusBadge";
 import { useAuth } from "@/context/AuthContext";
+import { Application } from "@/types";
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
 
 const activeJobs = [
   {
@@ -39,38 +44,6 @@ const activeJobs = [
   },
 ];
 
-const applications = [
-  {
-    id: "1",
-    job: "Governance Module for DAO",
-    status: "PENDING",
-    appliedAt: "2025-01-12",
-  },
-  {
-    id: "2",
-    job: "Data Analytics Dashboard",
-    status: "ACCEPTED",
-    appliedAt: "2025-01-10",
-  },
-  {
-    id: "3",
-    job: "Technical Docs Writer",
-    status: "REJECTED",
-    appliedAt: "2025-01-08",
-  },
-  {
-    id: "4",
-    job: "Brand Identity Design",
-    status: "PENDING",
-    appliedAt: "2025-01-14",
-  },
-  {
-    id: "5",
-    job: "NFT Marketplace Backend",
-    status: "PENDING",
-    appliedAt: "2025-01-13",
-  },
-];
 
 const postedJobs = [
   {
@@ -121,7 +94,7 @@ const pendingApplicants = [
 ];
 
 export default function DashboardPage() {
-  const { user, isLoading } = useAuth();
+  const { user, token, isLoading } = useAuth();
   const isClient = user?.role === "CLIENT";
 
   const clientTabs = ["My Posted Jobs", "Applicants to Review", "Messages"];
@@ -136,6 +109,50 @@ export default function DashboardPage() {
     setActiveTab(isClient ? clientTabs[0] : freelancerTabs[0]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isClient]);
+
+  // ── Real applications data (freelancer) ──────────────────────────────────
+  const [applications, setApplications] = useState<Application[]>([]);
+  const [appsLoading, setAppsLoading] = useState(false);
+  const [withdrawingId, setWithdrawingId] = useState<string | null>(null);
+  const [withdrawConfirmId, setWithdrawConfirmId] = useState<string | null>(null);
+
+  const fetchMyApplications = useCallback(async () => {
+    if (!token || !user?.id) return;
+    setAppsLoading(true);
+    try {
+      const res = await axios.get(`${API_URL}/applications`, {
+        params: { freelancerId: user.id, limit: 50 },
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      setApplications(res.data.data ?? []);
+    } catch {
+      setApplications([]);
+    } finally {
+      setAppsLoading(false);
+    }
+  }, [token, user?.id]);
+
+  useEffect(() => {
+    if (!isClient) {
+      void fetchMyApplications();
+    }
+  }, [isClient, fetchMyApplications]);
+
+  const handleWithdraw = async (appId: string) => {
+    setWithdrawingId(appId);
+    try {
+      await axios.delete(`${API_URL}/applications/${appId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      // Optimistic removal
+      setApplications((prev) => prev.filter((a) => a.id !== appId));
+    } catch {
+      // Keep list unchanged on error — user can retry
+    } finally {
+      setWithdrawingId(null);
+      setWithdrawConfirmId(null);
+    }
+  };
 
   const clientStats = [
     {
@@ -242,19 +259,89 @@ export default function DashboardPage() {
       {/* ── Freelancer tab content ── */}
       {!isClient && activeTab === "My Applications" && (
         <div className="space-y-4">
-          {applications.map((app) => (
-            <div key={app.id} className="card flex items-center justify-between">
-              <div>
-                <h3 className="font-semibold text-theme-heading">{app.job}</h3>
-                <p className="text-sm text-theme-text">
-                  Applied: {app.appliedAt}
-                </p>
-              </div>
-              <StatusBadge status={app.status} />
+          {appsLoading ? (
+            <div className="flex justify-center py-12">
+              <Loader2 className="animate-spin text-stellar-blue" size={32} />
             </div>
-          ))}
+          ) : applications.length === 0 ? (
+            <div className="card text-center py-12">
+              <FileText className="mx-auto text-theme-text mb-4" size={40} />
+              <h3 className="text-lg font-semibold text-theme-heading mb-2">No applications yet</h3>
+              <p className="text-theme-text text-sm">
+                Browse open jobs and submit your first application.
+              </p>
+            </div>
+          ) : (
+            applications.map((app) => (
+              <div key={app.id} className="card flex items-center justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <h3 className="font-semibold text-theme-heading truncate">
+                    {(app as Application & { job?: { title?: string } }).job?.title ?? "Job"}
+                  </h3>
+                  <p className="text-sm text-theme-text">
+                    Applied: {new Date(app.createdAt).toLocaleDateString()}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <StatusBadge status={app.status} />
+                  {app.status === "PENDING" && (
+                    <button
+                      onClick={() => setWithdrawConfirmId(app.id)}
+                      disabled={withdrawingId === app.id}
+                      className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-theme-error/50 text-theme-error hover:bg-theme-error/10 transition-colors disabled:opacity-50"
+                      title="Withdraw application"
+                    >
+                      {withdrawingId === app.id ? (
+                        <Loader2 size={12} className="animate-spin" />
+                      ) : (
+                        <Trash2 size={12} />
+                      )}
+                      Withdraw
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
         </div>
       )}
+
+      {/* Withdraw confirmation dialog */}
+      {withdrawConfirmId && (() => {
+        const app = applications.find((a) => a.id === withdrawConfirmId);
+        const jobTitle = (app as Application & { job?: { title?: string } } | undefined)?.job?.title ?? "this job";
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <div className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
+              <h2 className="text-lg font-semibold text-theme-heading mb-2">
+                Withdraw Application?
+              </h2>
+              <p className="text-sm text-theme-text mb-6">
+                Withdraw your application for{" "}
+                <span className="font-medium text-theme-heading">{jobTitle}</span>?
+                This cannot be undone.
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  onClick={() => setWithdrawConfirmId(null)}
+                  className="btn-secondary"
+                  disabled={!!withdrawingId}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => void handleWithdraw(withdrawConfirmId)}
+                  disabled={!!withdrawingId}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-theme-error text-white text-sm font-medium hover:bg-theme-error/90 transition-colors disabled:opacity-50"
+                >
+                  {withdrawingId ? <Loader2 size={14} className="animate-spin" /> : null}
+                  Withdraw
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {!isClient && activeTab === "Active Work" && (
         <div className="space-y-4">
