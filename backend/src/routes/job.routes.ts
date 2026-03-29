@@ -231,33 +231,39 @@ router.get("/saved",
     const { page = 1, limit = 10, search, skill, minBudget, maxBudget } = req.query as any;
     const skip = (Number(page) - 1) * Number(limit);
 
-    const where: any = {
+    // Build job filter conditions
+    const jobWhere: any = {
       status: "OPEN",
     };
 
     if (search) {
-      where.OR = [
+      jobWhere.OR = [
         { title: { contains: search, mode: "insensitive" } },
         { description: { contains: search, mode: "insensitive" } },
       ];
     }
 
     if (skill) {
-      where.skills = { has: skill };
+      jobWhere.skills = { has: skill };
     }
 
     if (minBudget || maxBudget) {
-      where.budget = {};
-      if (minBudget) where.budget.gte = Number(minBudget);
-      if (maxBudget) where.budget.lte = Number(maxBudget);
+      jobWhere.budget = {};
+      if (minBudget) jobWhere.budget.gte = Number(minBudget);
+      if (maxBudget) jobWhere.budget.lte = Number(maxBudget);
     }
+
+    // Build SavedJob where clause with job filters
+    const savedJobWhere: any = {
+      freelancerId: req.userId,
+      job: jobWhere,
+    };
 
     const [savedJobs, total] = await Promise.all([
       prisma.savedJob.findMany({
-        where: { freelancerId: req.userId },
+        where: savedJobWhere,
         include: {
           job: {
-            where,
             include: {
               client: { select: { id: true, username: true, avatarUrl: true } },
               milestones: true,
@@ -270,10 +276,7 @@ router.get("/saved",
         take: Number(limit),
       }),
       prisma.savedJob.count({
-        where: {
-          freelancerId: req.userId,
-          job: where,
-        },
+        where: savedJobWhere,
       }),
     ]);
 
