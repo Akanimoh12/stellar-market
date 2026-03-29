@@ -780,12 +780,12 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
-        // Cancellation is only allowed while the job is funded but not yet started.
-        if job.status != JobStatus::Funded {
+        // Cancellation is allowed while the job is Funded or InProgress.
+        if job.status != JobStatus::Funded && job.status != JobStatus::InProgress {
             return Err(EscrowError::InvalidStatus);
         }
 
-        // Guard: reject cancellation if any milestone has moved beyond Pending.
+        // Guard: reject cancellation if any milestone is actively InProgress or Submitted.
         // The client must open a dispute for in-flight work instead.
         let work_started = job
             .milestones
@@ -795,8 +795,14 @@ impl EscrowContract {
             return Err(EscrowError::WorkInProgress);
         }
 
-        // All milestones are Pending — refund the full escrowed amount to the client.
-        let refund = job.total_amount;
+        // Refund the remaining escrowed amount (total minus already-approved milestones).
+        let approved_amount: i128 = job
+            .milestones
+            .iter()
+            .filter(|m| m.status == MilestoneStatus::Approved)
+            .map(|m| m.amount)
+            .sum();
+        let refund = job.total_amount - approved_amount;
         if refund > 0 {
             let token_client = token::Client::new(&env, &job.token);
             token_client.transfer(&env.current_contract_address(), &client, &refund);
