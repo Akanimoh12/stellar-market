@@ -28,6 +28,7 @@ import ProposeRevisionModal, {
   type ProposeRevisionMilestoneInput,
 } from "@/components/ProposeRevisionModal";
 import { Job, Application, PaginatedResponse, Review } from "@/types";
+import { Job, Application, PaginatedResponse, Review } from "@/types";
 import { parseJobIdFromResult } from "@/utils/stellar";
 
 
@@ -680,6 +681,104 @@ export default function JobDetailPage() {
                 void handleUpdateMilestoneStatus(milestoneId, "REJECTED")
               }
             />
+          </div>
+
+          {job.status === "COMPLETED" && !myReview && (
+            <div className="card mt-8 border-stellar-blue/30 bg-stellar-blue/5">
+              <h2 className="text-lg font-semibold text-theme-heading mb-2">
+                Leave a review
+              </h2>
+              <p className="text-sm text-theme-text mb-4">
+                This job is complete. Share your experience to help build trust
+                on StellarMarket.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => setReviewModalOpen(true)}
+                >
+                  Review now
+                </button>
+                <Link
+                  href={`/jobs/${job.id}/review`}
+                  className="btn-secondary"
+                >
+                  Open review page
+                </Link>
+              </div>
+            </div>
+          )}
+
+          {/* Reviews */}
+          <div className="card mt-8">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-theme-heading">
+                Reviews
+              </h2>
+              {myReview ? (
+                <span className="text-xs text-theme-text">Already reviewed</span>
+              ) : null}
+            </div>
+
+            {reviewsLoading ? (
+              <div className="flex justify-center py-6">
+                <Loader2 className="animate-spin text-stellar-blue" size={28} />
+              </div>
+            ) : reviews.length === 0 ? (
+              <p className="text-sm text-theme-text">No reviews yet.</p>
+            ) : (
+              <div className="space-y-4">
+                {reviews.map((review) => (
+                  <div
+                    key={review.id}
+                    className="p-4 bg-theme-bg rounded-lg border border-theme-border"
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <div className="w-9 h-9 rounded-full bg-gradient-to-br from-stellar-blue to-stellar-purple flex items-center justify-center text-white text-sm font-bold overflow-hidden">
+                          {review.reviewer.avatarUrl ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={review.reviewer.avatarUrl}
+                              alt={review.reviewer.username}
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            review.reviewer.username.charAt(0).toUpperCase()
+                          )}
+                        </div>
+                        <div>
+                          <div className="text-sm font-medium text-theme-heading">
+                            {review.reviewer.username}
+                          </div>
+                          <div className="text-xs text-theme-text">
+                            {new Date(review.createdAt).toLocaleDateString()}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1">
+                        {[1, 2, 3, 4, 5].map((star) => (
+                          <Star
+                            key={star}
+                            size={16}
+                            className={
+                              star <= review.rating
+                                ? "fill-yellow-400 text-yellow-400"
+                                : "text-theme-border"
+                            }
+                          />
+                        ))}
+                      </div>
+                    </div>
+                    <p className="text-sm text-theme-text mt-3 whitespace-pre-line">
+                      {review.comment}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {job.status === "COMPLETED" && !myReview && (
