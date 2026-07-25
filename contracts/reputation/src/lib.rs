@@ -287,6 +287,9 @@ enum DataKey {
     /// Admin-configurable minimum stake weight. Reviews with stake_weight below
     /// this value are rejected even when the economic min_stake allows zero stakes.
     MinStakeWeight,
+    /// Marks a user as banned by an admin. Banned users are excluded from
+    /// leaderboard queries.
+    BannedUser(Address),
 }
 
 fn require_not_paused(env: &Env) -> Result<(), ReputationError> {
@@ -1345,6 +1348,44 @@ impl ReputationContract {
         Ok(())
     }
 
+    /// Ban a user, excluding them from all leaderboard queries (admin/signer only).
+    pub fn ban_user(env: Env, admin: Address, user: Address) -> Result<(), ReputationError> {
+        admin.require_auth();
+        if !is_signer(&env, &admin) {
+            return Err(ReputationError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BannedUser(user.clone()), &true);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "banned")),
+            (user, admin),
+        );
+
+        Ok(())
+    }
+
+    /// Unban a user, restoring their visibility on the leaderboard (admin/signer only).
+    pub fn unban_user(env: Env, admin: Address, user: Address) -> Result<(), ReputationError> {
+        admin.require_auth();
+        if !is_signer(&env, &admin) {
+            return Err(ReputationError::NotAdmin);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::BannedUser(user.clone()));
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "unbanned")),
+            (user, admin),
+        );
+
+        Ok(())
+    }
+
     pub fn propose_admin_action(
         env: Env,
         proposer: Address,
@@ -1959,6 +2000,19 @@ impl ReputationContract {
             }
             None => return Vec::new(&env),
         };
+
+        let mut filtered = Vec::new(&env);
+        for entry in list.iter() {
+            let is_banned: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::BannedUser(entry.0.clone()))
+                .unwrap_or(false);
+            if !is_banned {
+                filtered.push_back(entry);
+            }
+        }
+        let list = filtered;
 
         let total = list.len();
         if offset >= total {

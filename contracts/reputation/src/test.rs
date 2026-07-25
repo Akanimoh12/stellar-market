@@ -2507,6 +2507,69 @@ fn test_leaderboard_removes_fully_decayed_user() {
     assert!(!after.iter().any(|(addr, _)| addr == reviewee));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #774 — Banned users are excluded from the leaderboard
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_banned_user_excluded_from_leaderboard() {
+    let env = setup_high_ttl_env();
+    env.mock_all_auths();
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let reviewer = Address::generate(&env);
+    let reviewee = Address::generate(&env);
+    setup_review_for(&env, &escrow_id, &client, 1, &reviewer, &reviewee, 5);
+
+    let before = client.get_leaderboard();
+    assert!(before.iter().any(|(addr, _)| addr == reviewee));
+
+    client.ban_user(&admin, &reviewee);
+
+    let after = client.get_leaderboard();
+    assert!(!after.iter().any(|(addr, _)| addr == reviewee));
+}
+
+#[test]
+fn test_unban_user_restores_leaderboard_visibility() {
+    let env = setup_high_ttl_env();
+    env.mock_all_auths();
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let reviewer = Address::generate(&env);
+    let reviewee = Address::generate(&env);
+    setup_review_for(&env, &escrow_id, &client, 1, &reviewer, &reviewee, 5);
+
+    client.ban_user(&admin, &reviewee);
+    assert!(!client.get_leaderboard().iter().any(|(addr, _)| addr == reviewee));
+
+    client.unban_user(&admin, &reviewee);
+    assert!(client.get_leaderboard().iter().any(|(addr, _)| addr == reviewee));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")] // NotAdmin
+fn test_ban_user_by_non_admin_rejected() {
+    let env = setup_high_ttl_env();
+    env.mock_all_auths();
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let non_admin = Address::generate(&env);
+    let target = Address::generate(&env);
+    client.ban_user(&non_admin, &target);
+}
+
 // ── Issue #771: minimum stake weight threshold ───────────────────────────────
 
 #[test]

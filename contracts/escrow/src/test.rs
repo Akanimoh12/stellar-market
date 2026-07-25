@@ -112,6 +112,56 @@ fn test_create_job() {
 }
 
 #[test]
+fn test_create_job_self_employment_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client_addr, _freelancer, token, _admin) = setup_test(&env);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "Design mockups"), 500_i128, JOB_DEADLINE),
+    ];
+
+    let result = contract.try_create_job(
+        &client_addr,
+        &client_addr,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    assert_eq!(result, Err(Ok(EscrowError::Unauthorized)));
+}
+
+#[test]
+fn test_create_job_distinct_addresses_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client_addr, freelancer, token, _admin) = setup_test(&env);
+
+    let milestones = vec![
+        &env,
+        (String::from_str(&env, "Design mockups"), 500_i128, JOB_DEADLINE),
+    ];
+
+    let job_id = contract.create_job(
+        &client_addr,
+        &freelancer,
+        &token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    assert_eq!(job_id, 1);
+}
+
+#[test]
 fn test_extend_deadline_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
