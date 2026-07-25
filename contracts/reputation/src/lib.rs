@@ -31,12 +31,21 @@ mod escrow {
 
     #[contracttype]
     #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct TokenBalance {
+        pub token: Address,
+        pub total_amount: i128,
+        pub funded_amount: i128,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct Milestone {
         pub id: u32,
         pub description: String,
         pub amount: i128,
         pub status: MilestoneStatus,
         pub deadline: u64,
+        pub token: Option<Address>,
     }
 
     #[contracttype]
@@ -52,6 +61,7 @@ mod escrow {
         pub milestones: Vec<Milestone>,
         pub status: JobStatus,
         pub token: Address,
+        pub token_balances: Vec<TokenBalance>,
         pub total_amount: i128,
     }
 
