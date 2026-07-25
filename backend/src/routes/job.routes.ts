@@ -36,6 +36,22 @@ import { MAX_PAGE_SIZE } from "../config";
 
 const router = Router();
 
+const VALID_CATEGORIES = [
+  "Frontend",
+  "Backend",
+  "Smart Contract",
+  "Design",
+  "Mobile",
+  "Documentation",
+  "DevOps",
+] as const;
+
+function isValidCategory(value: string): boolean {
+  return VALID_CATEGORIES.some(
+    (c) => c.toLowerCase() === value.trim().toLowerCase(),
+  );
+}
+
 const JOB_LIST_SELECT = {
   id: true, title: true, description: true, budget: true, status: true,
   category: true, createdAt: true, skills: true, deadline: true,
@@ -310,7 +326,9 @@ router.get(
       }
 
       if (category) {
-        where.category = { equals: category, mode: "insensitive" };
+        // Accept slug form (e.g. "smart-contract") or canonical form ("Smart Contract").
+        const normalised = (category as string).replace(/-/g, " ");
+        where.category = { equals: normalised, mode: "insensitive" };
       }
 
       if (status) {
@@ -804,13 +822,21 @@ router.post(
     }
 
     const { title, description, budget, skills, deadline } = req.body;
+    const category = req.body.category as string | undefined;
+
+    if (category && !isValidCategory(category)) {
+      return res.status(422).json({
+        code: "InvalidCategory",
+        message: `"${category}" is not a recognised category. Valid categories: ${VALID_CATEGORIES.join(", ")}.`,
+      });
+    }
 
     const job = await prisma.job.create({
       data: {
         title,
         description,
         budget,
-        category: req.body.category || "General",
+        category: category || "General",
         skills,
         deadline: new Date(deadline),
         clientId: req.userId!,
@@ -862,6 +888,14 @@ router.put(
     }
 
     const updateData = req.body;
+
+    if (updateData.category && !isValidCategory(updateData.category)) {
+      return res.status(422).json({
+        code: "InvalidCategory",
+        message: `"${updateData.category}" is not a recognised category. Valid categories: ${VALID_CATEGORIES.join(", ")}.`,
+      });
+    }
+
     if (updateData.deadline) {
       updateData.deadline = new Date(updateData.deadline);
     }

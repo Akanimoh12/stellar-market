@@ -10,19 +10,206 @@ import {
   overrideDisputeSchema,
   queryPendingDisputesSchema,
   queryFlaggedUsersSchema,
+  getAuditLogsQuerySchema,
 } from "../schemas/admin";
 import { z, ZodError } from "zod";
 import { logAdminAction } from "../utils/auditLogger";
+import { AuditService } from "../services/audit.service";
 import { NotificationService } from "../services/notification.service";
 import { validate } from "../middleware/validation";
+import {
+  getHorizonStatus,
+  overrideHorizonCursor,
+  replayHorizonDlq,
+} from "../services/horizon-listener.service";
 import { projectJobState } from "../services/escrow-projection.service";
 import { ReputationCacheService } from "../services/reputation-cache.service";
 
 const router = Router();
 const prisma = new PrismaClient();
 
+/**
+ * GET /api/admin/horizon/status
+ * Return the durable listener cursor and unresolved DLQ depth.
+ */
+router.get(
+  "/horizon/status",
+  async (_req: AuthRequest, res: Response): Promise<void> => {
+    try {
+      res.json(await getHorizonStatus());
+    } catch (error) {
+      console.error("Error fetching Horizon listener status:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+/**
+ * POST /api/admin/horizon/dlq/replay
+ * Replay unresolved failed events in cursor order.
+ */
+router.post(
+  "/horizon/dlq/replay",
+  async (_req: AuthRequest, res: Response): Promise<void> => {
+    try {
+      res.json(await replayHorizonDlq());
+    } catch (error) {
+      console.error("Error replaying Horizon DLQ:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+/**
+ * POST /api/admin/horizon/cursor
+ * Manually replace the persisted paging token for disaster recovery.
+ */
+router.post(
+  "/horizon/cursor",
+  validate({
+    body: z.object({
+      cursor: z.string().trim().min(1, "Cursor is required"),
+    }),
+  }),
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+      const { cursor } = req.body as { cursor: string };
+      await overrideHorizonCursor(cursor);
+      res.json({ cursor });
+    } catch (error) {
+      console.error("Error overriding Horizon cursor:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 // Apply requireAdmin middleware to all admin routes
 router.use(requireAdmin);
+
+/**
+ * GET /api/admin/audit-logs
+ * Query the unified, hash-chained audit trail (issue #875) with filters and
+ * pagination. Supports `format=csv` for export. Covers both admin actions and
+ * security events, since both now live in the one table.
+ */
+router.get(
+  "/audit-logs",
+  async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+      const query = getAuditLogsQuerySchema.parse(req.query);
+      const { page, limit, category, action, actorId, from, to, format } = query;
+
+      const where: any = {};
+      if (category) where.category = category;
+      if (action) where.action = action;
+      if (actorId) where.actorId = actorId;
+      if (from || to) {
+        where.timestamp = {};
+        if (from) where.timestamp.gte = from;
+        if (to) where.timestamp.lte = to;
+      }
+
+      if (format === "csv") {
+        // Export the full filtered set (cap protects against unbounded scans).
+        const rows = await prisma.auditLog.findMany({
+          where,
+          orderBy: { sequence: "asc" },
+          take: 10000,
+        });
+        const header = [
+          "sequence",
+          "category",
+          "action",
+          "actorId",
+          "target",
+          "ipAddress",
+          "timestamp",
+          "prevHash",
+          "hash",
+          "metadata",
+        ];
+        const escape = (v: unknown): string => {
+          const s = v === null || v === undefined ? "" : String(v);
+          return `"${s.replace(/"/g, '""')}"`;
+        };
+        const lines = [header.join(",")];
+        for (const r of rows) {
+          lines.push(
+            [
+              r.sequence,
+              r.category,
+              r.action,
+              r.actorId,
+              r.target,
+              r.ipAddress,
+              r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+              r.prevHash,
+              r.hash,
+              r.metadata === null || r.metadata === undefined
+                ? ""
+                : JSON.stringify(r.metadata),
+            ]
+              .map(escape)
+              .join(","),
+          );
+        }
+        res.setHeader("Content-Type", "text/csv");
+        res.setHeader(
+          "Content-Disposition",
+          'attachment; filename="audit-logs.csv"',
+        );
+        res.send(lines.join("\n"));
+        return;
+      }
+
+      const skip = (page - 1) * limit;
+      const [entries, total] = await Promise.all([
+        prisma.auditLog.findMany({
+          where,
+          orderBy: { sequence: "desc" },
+          skip,
+          take: limit,
+        }),
+        prisma.auditLog.count({ where }),
+      ]);
+
+      res.json({
+        entries,
+        pagination: {
+          total,
+          page,
+          limit,
+          totalPages: Math.ceil(total / limit),
+        },
+      });
+    } catch (error) {
+      if (error instanceof ZodError) {
+        res.status(400).json({ error: "Invalid query", details: error.issues });
+        return;
+      }
+      console.error("Error querying audit logs:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+/**
+ * GET /api/admin/audit-logs/verify
+ * Recompute the hash chain and report whether it is intact, flagging the first
+ * point at which any historical entry was altered, reordered, or deleted.
+ */
+router.get(
+  "/audit-logs/verify",
+  async (_req: AuthRequest, res: Response): Promise<void> => {
+    try {
+      const result = await AuditService.verifyChain();
+      res.status(result.valid ? 200 : 409).json(result);
+    } catch (error) {
+      console.error("Error verifying audit log chain:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 /**
  * GET /api/admin/users
@@ -414,21 +601,34 @@ router.get(
         prisma.auditLog.findMany({
           skip,
           take: limit,
-          include: {
-            admin: {
-              select: {
-                id: true,
-                username: true,
-              },
-            },
-          },
-          orderBy: { timestamp: "desc" },
+          orderBy: { sequence: "desc" },
         }),
         prisma.auditLog.count(),
       ]);
 
+      // actorId is now a free-form string (admin id, end-user id, or the
+      // sentinel "system"), so there is no FK to join on. Resolve display info
+      // for the actorIds that map to a real user and expose it under `admin`
+      // for backward compatibility with existing consumers (issue #875).
+      const actorIds = [
+        ...new Set(
+          logs.map((l) => l.actorId).filter((v): v is string => Boolean(v)),
+        ),
+      ];
+      const actors = actorIds.length
+        ? await prisma.user.findMany({
+            where: { id: { in: actorIds } },
+            select: { id: true, username: true },
+          })
+        : [];
+      const actorMap = new Map(actors.map((a) => [a.id, a]));
+      const logsWithActor = logs.map((l) => ({
+        ...l,
+        admin: l.actorId ? actorMap.get(l.actorId) ?? null : null,
+      }));
+
       res.json({
-        logs,
+        logs: logsWithActor,
         pagination: {
           total,
           page,
@@ -794,21 +994,34 @@ router.get(
         prisma.auditLog.findMany({
           skip,
           take: limit,
-          include: {
-            admin: {
-              select: {
-                id: true,
-                username: true,
-              },
-            },
-          },
-          orderBy: { timestamp: "desc" },
+          orderBy: { sequence: "desc" },
         }),
         prisma.auditLog.count(),
       ]);
 
+      // actorId is now a free-form string (admin id, end-user id, or the
+      // sentinel "system"), so there is no FK to join on. Resolve display info
+      // for the actorIds that map to a real user and expose it under `admin`
+      // for backward compatibility with existing consumers (issue #875).
+      const actorIds = [
+        ...new Set(
+          logs.map((l) => l.actorId).filter((v): v is string => Boolean(v)),
+        ),
+      ];
+      const actors = actorIds.length
+        ? await prisma.user.findMany({
+            where: { id: { in: actorIds } },
+            select: { id: true, username: true },
+          })
+        : [];
+      const actorMap = new Map(actors.map((a) => [a.id, a]));
+      const logsWithActor = logs.map((l) => ({
+        ...l,
+        admin: l.actorId ? actorMap.get(l.actorId) ?? null : null,
+      }));
+
       res.json({
-        logs,
+        logs: logsWithActor,
         pagination: {
           total,
           page,
@@ -1092,6 +1305,7 @@ router.post(
 
 const REPORT_STATUSES = ["PENDING", "REVIEWED", "DISMISSED"] as const;
 
+
 /**
  * GET /api/admin/reports
  * List all reports, filterable by status and targetType.
@@ -1344,89 +1558,5 @@ router.get(
   },
 );
 
-/**
- * GET /api/admin/horizon/status
- * Get Horizon listener status including cursor and DLQ depth
- */
-router.get(
-  "/horizon/status",
-  async (_req: AuthRequest, res: Response): Promise<void> => {
-    try {
-      const { getHorizonStatus } =
-        await import("../services/horizon-listener.service");
-      const status = await getHorizonStatus();
-      res.json(status);
-    } catch (error) {
-      console.error("Error getting Horizon status:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  },
-);
-
-/**
- * POST /api/admin/horizon/cursor
- * Manually set Horizon cursor for disaster recovery
- */
-router.post(
-  "/horizon/cursor",
-  validate({
-    body: z.object({
-      cursor: z.string().min(1, "Cursor is required"),
-    }),
-  }),
-  async (req: AuthRequest, res: Response): Promise<void> => {
-    try {
-      const { cursor } = req.body as { cursor: string };
-
-      await prisma.horizonCursor.upsert({
-        where: { id: 1 },
-        update: { cursor },
-        create: { id: 1, cursor },
-      });
-
-      await logAdminAction(req.userId!, "HORIZON_CURSOR_OVERRIDE", "horizon", {
-        cursor,
-      });
-
-      res.json({
-        message: "Horizon cursor updated successfully",
-        cursor,
-      });
-    } catch (error) {
-      console.error("Error updating Horizon cursor:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  },
-);
-
-/**
- * POST /api/admin/horizon/dlq/replay
- * Replay all unresolved DLQ entries
- */
-router.post(
-  "/horizon/dlq/replay",
-  async (req: AuthRequest, res: Response): Promise<void> => {
-    try {
-      const { replayDLQ } =
-        await import("../services/horizon-listener.service");
-      const result = await replayDLQ();
-
-      await logAdminAction(
-        req.userId!,
-        "HORIZON_DLQ_REPLAY",
-        "horizon",
-        result,
-      );
-
-      res.json({
-        message: "DLQ replay completed",
-        ...result,
-      });
-    } catch (error) {
-      console.error("Error replaying DLQ:", error);
-      res.status(500).json({ error: "Internal server error" });
-    }
-  },
-);
 
 export default router;

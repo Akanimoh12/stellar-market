@@ -3,8 +3,8 @@
 use super::*;
 use soroban_sdk::{
     contract, contractimpl,
-    testutils::{Address as _, Events, Ledger},
-    Env, String,
+    testutils::{Address as _, BytesN as _, Events, Ledger},
+    BytesN, Env, String,
 };
 
 // Helper macro to add arbitrators and get assigned ones for a dispute
@@ -25,6 +25,24 @@ pub struct DummyEscrow;
 impl DummyEscrow {
     pub fn resolve_dispute_callback(_env: Env, _job_id: u64, _resolution: DisputeResolution) {}
 }
+
+/// Escrow that always panics on resolve_dispute_callback — used to simulate a failing cross-contract call.
+/// Must live in its own module to avoid #[contractimpl] symbol collision with DummyEscrow.
+mod failing_escrow {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl, Env};
+
+    #[contract]
+    pub struct DummyEscrowFailing;
+
+    #[contractimpl]
+    impl DummyEscrowFailing {
+        pub fn resolve_dispute_callback(_env: Env, _job_id: u64, _resolution: DisputeResolution) {
+            panic!("escrow_fail_simulated");
+        }
+    }
+}
+use failing_escrow::DummyEscrowFailing;
 
 // Mock reputation contract for testing
 #[contract]
@@ -2628,4 +2646,474 @@ fn test_cast_vote_nonce_replay_rejected() {
 
     // voter1 tries to replay nonce 99 — should fail with NonceReplay
     client.cast_vote(&dispute_id, &voter1, &VoteChoice::Client, &String::from_str(&env, "replay"), &99);
+}
+
+// ── Issue #770: submit_evidence emits on-chain event ────────────────────────
+
+#[test]
+fn test_submit_evidence_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+
+    let party_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &party_client,
+        &freelancer,
+        &party_client,
+        &String::from_str(&env, "Work not delivered"),
+        &3u32,
+        &None,
+    );
+
+    let hash: BytesN<32> = BytesN::random(&env);
+    client.submit_evidence(&dispute_id, &party_client, &hash);
+
+    let events = env.events().all();
+    assert!(!events.is_empty(), "at least one event should have been emitted");
+}
+
+#[test]
+fn test_submit_evidence_stores_and_retrieves() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+
+    let party_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &party_client,
+        &freelancer,
+        &party_client,
+        &String::from_str(&env, "Scope creep"),
+        &3u32,
+        &None,
+    );
+
+    let hash1: BytesN<32> = BytesN::random(&env);
+    let hash2: BytesN<32> = BytesN::random(&env);
+
+    client.submit_evidence(&dispute_id, &party_client, &hash1);
+    client.submit_evidence(&dispute_id, &freelancer, &hash2);
+
+    let evidence = client.get_evidence(&dispute_id);
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence.get(0).unwrap().evidence_hash, hash1);
+    assert_eq!(evidence.get(1).unwrap().evidence_hash, hash2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_submit_evidence_rejects_non_party() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+
+    let party_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let outsider = Address::generate(&env);
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &party_client,
+        &freelancer,
+        &party_client,
+        &String::from_str(&env, "Breach"),
+        &3u32,
+        &None,
+    );
+
+    let hash: BytesN<32> = BytesN::random(&env);
+    client.submit_evidence(&dispute_id, &outsider, &hash);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_submit_evidence_rejects_nonexistent_dispute() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+
+    let submitter = Address::generate(&env);
+    let hash: BytesN<32> = BytesN::random(&env);
+    client.submit_evidence(&999u64, &submitter, &hash);
+}
+
+// ── Issue #773: vote_choice validated against defined VoteChoice variants ────
+
+#[test]
+fn test_cast_vote_valid_choices_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let reputation_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin, &reputation_id, &0, &escrow_id);
+
+    let party_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    for _ in 0..5 {
+        client.add_arbitrator(&admin, &Address::generate(&env));
+    }
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &party_client,
+        &freelancer,
+        &party_client,
+        &String::from_str(&env, "dispute"),
+        &3u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+
+    // VoteChoice::Client is accepted
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(0).unwrap(),
+        &VoteChoice::Client,
+        &String::from_str(&env, "for client"),
+        &1u64,
+    );
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.votes_for_client, 1);
+
+    // VoteChoice::Freelancer is accepted
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(1).unwrap(),
+        &VoteChoice::Freelancer,
+        &String::from_str(&env, "for freelancer"),
+        &2u64,
+    );
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.votes_for_freelancer, 1);
+
+    // VoteChoice::RefundSplit is accepted with a valid percentage
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(2).unwrap(),
+        &VoteChoice::RefundSplit(50u32),
+        &String::from_str(&env, "refund split"),
+        &3u64,
+    );
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.votes_for_refund_split, 1);
+}
+
+#[test]
+fn test_invalid_vote_choice_error_code_is_24() {
+    // Verify that InvalidVoteChoice maps to discriminant 24.
+    // This ensures the on-chain ABI is stable and clients can reliably detect the error.
+    assert_eq!(DisputeError::InvalidVoteChoice as u32, 24);
+}
+
+#[test]
+fn test_cast_vote_split_award_bps_validation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let reputation_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin, &reputation_id, &0, &escrow_id);
+
+    let party_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    for _ in 0..5 {
+        client.add_arbitrator(&admin, &Address::generate(&env));
+    }
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &party_client,
+        &freelancer,
+        &party_client,
+        &String::from_str(&env, "dispute"),
+        &3u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+
+    // SplitAward with valid bps (client_bps + freelancer_bps == 10_000) is accepted
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(0).unwrap(),
+        &VoteChoice::SplitAward(6000u32, 4000u32),
+        &String::from_str(&env, "split"),
+        &1u64,
+    );
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.votes_for_split_award, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_cast_vote_split_award_invalid_bps_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &contract_id);
+    let escrow_id = env.register_contract(None, DummyEscrow);
+    let reputation_id = env.register_contract(None, MockReputationContract);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin, &reputation_id, &0, &escrow_id);
+
+    let party_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    for _ in 0..5 {
+        client.add_arbitrator(&admin, &Address::generate(&env));
+    }
+
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &party_client,
+        &freelancer,
+        &party_client,
+        &String::from_str(&env, "dispute"),
+        &3u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+
+    // SplitAward where bps don't sum to 10_000 — InvalidSplitBps (#18)
+    client.cast_vote(
+        &dispute_id,
+        &assigned.get(0).unwrap(),
+        &VoteChoice::SplitAward(9999u32, 0u32),
+        &String::from_str(&env, "bad split"),
+        &1u64,
+    );
+}
+
+// ─── Escrow deadlock recovery tests (issue #867) ───────────────────────────
+
+fn setup_dispute_with_failing_escrow(
+    env: &Env,
+) -> (DisputeContractClient, Address, Address, u64) {
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(env, &dispute_contract_id);
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+    // Register the *failing* escrow so every resolve_dispute_callback panics.
+    let escrow_contract_id = env.register_contract(None, DummyEscrowFailing);
+    let admin = Address::generate(env);
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    for _ in 0..5 {
+        let arb = Address::generate(env);
+        client.add_arbitrator(&admin, &arb);
+    }
+
+    let job_client = Address::generate(env);
+    let freelancer = Address::generate(env);
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &job_client,
+        &freelancer,
+        &job_client,
+        &String::from_str(env, "test dispute"),
+        &3u32,
+        &None,
+    );
+    (client, job_client, freelancer, dispute_id)
+}
+
+/// When the escrow panics during resolution the dispute lands in ResolutionFailed,
+/// not a contract panic, and the pending resolution is stored.
+#[test]
+fn test_resolve_dispute_escrow_fail_enters_resolution_failed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _job_client, _freelancer, dispute_id) =
+        setup_dispute_with_failing_escrow(&env);
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(&dispute_id, &assigned.get(0).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &0u64);
+    client.cast_vote(&dispute_id, &assigned.get(1).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &1u64);
+    client.cast_vote(&dispute_id, &assigned.get(2).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &2u64);
+
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::ResolutionFailed);
+}
+
+/// After escrow is fixed, retry_escrow_callback transitions the dispute to the
+/// correct terminal status (ResolvedForClient here).
+#[test]
+fn test_retry_escrow_callback_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    // Phase 1: resolve with broken escrow → ResolutionFailed.
+    let (client, _job_client, _freelancer, dispute_id) =
+        setup_dispute_with_failing_escrow(&env);
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(&dispute_id, &assigned.get(0).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &0u64);
+    client.cast_vote(&dispute_id, &assigned.get(1).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &1u64);
+    client.cast_vote(&dispute_id, &assigned.get(2).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &2u64);
+
+    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::ResolutionFailed);
+
+    // Phase 2: "fix" the escrow by pointing the contract at a working one.
+    let working_escrow_id = env.register_contract(None, DummyEscrow);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &working_escrow_id);
+    });
+
+    // Phase 3: retry should succeed.
+    let status = client.retry_escrow_callback(&dispute_id);
+    assert_eq!(status, DisputeStatus::ResolvedForClient);
+
+    let dispute = client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::ResolvedForClient);
+}
+
+/// Calling retry when the escrow is still broken does not panic or change state —
+/// it returns ResolutionFailed so the caller can try again later.
+#[test]
+fn test_retry_escrow_callback_idempotent_on_still_failing_escrow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _job_client, _freelancer, dispute_id) =
+        setup_dispute_with_failing_escrow(&env);
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(&dispute_id, &assigned.get(0).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &0u64);
+    client.cast_vote(&dispute_id, &assigned.get(1).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &1u64);
+    client.cast_vote(&dispute_id, &assigned.get(2).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &2u64);
+
+    // First retry — escrow still broken.
+    let status1 = client.retry_escrow_callback(&dispute_id);
+    assert_eq!(status1, DisputeStatus::ResolutionFailed);
+
+    // Second retry — still broken, same result.
+    let status2 = client.retry_escrow_callback(&dispute_id);
+    assert_eq!(status2, DisputeStatus::ResolutionFailed);
+
+    // Dispute should still be in ResolutionFailed.
+    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::ResolutionFailed);
+}
+
+/// The MaliciousFiling escrow path also parks into ResolutionFailed on failure
+/// and succeeds after retry.
+#[test]
+fn test_malicious_filing_escrow_fail_and_retry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+    let escrow_contract_id = env.register_contract(None, DummyEscrowFailing);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    for _ in 0..10 {
+        let arb = Address::generate(&env);
+        client.add_arbitrator(&admin, &arb);
+    }
+
+    let job_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &job_client,
+        &freelancer,
+        &job_client,
+        &String::from_str(&env, "bad faith"),
+        &5u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(&dispute_id, &assigned.get(0).unwrap(), &VoteChoice::MaliciousFiling, &String::from_str(&env, "bad faith"), &0u64);
+    client.cast_vote(&dispute_id, &assigned.get(1).unwrap(), &VoteChoice::MaliciousFiling, &String::from_str(&env, "bad faith"), &1u64);
+    client.cast_vote(&dispute_id, &assigned.get(2).unwrap(), &VoteChoice::MaliciousFiling, &String::from_str(&env, "bad faith"), &2u64);
+    client.cast_vote(&dispute_id, &assigned.get(3).unwrap(), &VoteChoice::MaliciousFiling, &String::from_str(&env, "bad faith"), &3u64);
+    client.cast_vote(&dispute_id, &assigned.get(4).unwrap(), &VoteChoice::Client,           &String::from_str(&env, "disagree"), &4u64);
+
+    assert_eq!(client.get_dispute(&dispute_id).status, DisputeStatus::ResolutionFailed);
+
+    // Fix the escrow and retry.
+    let working_escrow_id = env.register_contract(None, DummyEscrow);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &working_escrow_id);
+    });
+
+    let status = client.retry_escrow_callback(&dispute_id);
+    assert_eq!(status, DisputeStatus::MaliciousDisputeFiling);
+}
+
+/// Calling retry_escrow_callback on an already-resolved dispute returns AlreadyResolved.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_retry_on_already_resolved_dispute_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let dispute_contract_id = env.register_contract(None, DisputeContract);
+    let client = DisputeContractClient::new(&env, &dispute_contract_id);
+    let reputation_contract_id = env.register_contract(None, MockReputationContract);
+    let escrow_contract_id = env.register_contract(None, DummyEscrow);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &reputation_contract_id, &300, &escrow_contract_id);
+
+    for _ in 0..3 {
+        let arb = Address::generate(&env);
+        client.add_arbitrator(&admin, &arb);
+    }
+
+    let job_client = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let dispute_id = client.raise_dispute(
+        &1u64,
+        &job_client,
+        &freelancer,
+        &job_client,
+        &String::from_str(&env, "test"),
+        &3u32,
+        &None,
+    );
+
+    let assigned = client.get_assigned_arbitrators(&dispute_id);
+    client.cast_vote(&dispute_id, &assigned.get(0).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &0u64);
+    client.cast_vote(&dispute_id, &assigned.get(1).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &1u64);
+    client.cast_vote(&dispute_id, &assigned.get(2).unwrap(), &VoteChoice::Client, &String::from_str(&env, "r"), &2u64);
+
+    // Dispute is now ResolvedForClient — retry should return AlreadyResolved (#7).
+    client.retry_escrow_callback(&dispute_id);
 }

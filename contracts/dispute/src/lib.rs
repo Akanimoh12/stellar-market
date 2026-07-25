@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env,
+    IntoVal, String, Symbol, Vec,
 };
 
 // Import reputation contract types for cross-contract calls
@@ -46,6 +46,8 @@ pub enum DisputeError {
     AppealNotFound = 21,
     NonceReplay = 22,
     DuplicateArbitrator = 23,
+    /// Returned when a vote_choice value does not map to a defined VoteChoice variant.
+    InvalidVoteChoice = 24,
 }
 
 #[contracttype]
@@ -61,6 +63,8 @@ pub enum DisputeStatus {
     Escalated,
     /// Filing was determined to be in bad faith by a 4/5 supermajority of arbitrators.
     MaliciousDisputeFiling,
+    /// Escrow callback failed; the intended resolution is cached and can be retried.
+    ResolutionFailed,
 }
 
 #[contracttype]
@@ -132,6 +136,15 @@ pub struct Vote {
     pub choice: VoteChoice,
     pub reason: String,
     pub timestamp: u64,
+}
+
+/// A single piece of evidence attached to a dispute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRecord {
+    pub submitted_by: Address,
+    pub evidence_hash: BytesN<32>,
+    pub ledger: u32,
 }
 
 /// Maximum number of arbitrators that can be assigned to a single dispute.
@@ -242,6 +255,10 @@ enum DataKey {
     Nonce(Address, Symbol, u64),
     /// Stores the resolved split ratio for audit when a tie produces a 50/50 split.
     SplitRatio(u64),
+    /// Maps dispute_id → Vec<EvidenceRecord> for all submitted evidence.
+    Evidence(u64),
+    /// Caches the intended `DisputeResolution` when the escrow callback fails; cleared on retry success.
+    PendingResolution(u64),
 }
 
 fn require_not_paused(env: &Env) -> Result<(), DisputeError> {
@@ -390,6 +407,22 @@ fn bump_dispute_tally_ttl(env: &Env, dispute_id: u64) {
 fn bump_arbitrators_ttl(env: &Env, dispute_id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::Arbitrators(dispute_id),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+}
+
+fn bump_evidence_ttl(env: &Env, dispute_id: u64) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Evidence(dispute_id),
+        MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+}
+
+fn bump_pending_resolution_ttl(env: &Env, dispute_id: u64) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::PendingResolution(dispute_id),
         MIN_TTL_THRESHOLD,
         MIN_TTL_EXTEND_TO,
     );
@@ -1534,66 +1567,88 @@ impl DisputeContract {
                 .get(&DataKey::EscrowContract)
                 .ok_or(DisputeError::NotInitialized)?;
 
-            env.invoke_contract::<()>(
-                &escrow_addr,
-                &Symbol::new(&env, "resolve_dispute_callback"),
-                vec![&env, dispute.job_id.into_val(&env), resolution.clone().into_val(&env)],
+            let escrow_ok = matches!(
+                env.try_invoke_contract::<(), soroban_sdk::Error>(
+                    &escrow_addr,
+                    &Symbol::new(&env, "resolve_dispute_callback"),
+                    vec![&env, dispute.job_id.into_val(&env), resolution.clone().into_val(&env)],
+                ),
+                Ok(Ok(_))
             );
 
-            // Double-rate reputation slash to deter frivolous appeals.
-            if let Some(reputation_contract) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Address>(&DataKey::ReputationContract)
-            {
-                let loser = match resolution {
-                    DisputeResolution::ClientWins => dispute.freelancer.clone(),
-                    DisputeResolution::FreelancerWins => dispute.client.clone(),
-                    _ => ap.appellant.clone(),
-                };
+            if !escrow_ok {
+                dispute.status = DisputeStatus::ResolutionFailed;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PendingResolution(ap.dispute_id), &resolution);
+                bump_pending_resolution_ttl(&env, ap.dispute_id);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Dispute(ap.dispute_id), &dispute);
+                bump_dispute_ttl(&env, ap.dispute_id);
+                env.events().publish(
+                    (symbol_short!("dispute"), Symbol::new(&env, "escrow_fail")),
+                    (ap.dispute_id, dispute.job_id),
+                );
+                // Appeal itself is finalized; skip reputation slash and fall through to persist appeal.
+            }
 
-                let slash_bps: u32 = env
+            // Double-rate reputation slash to deter frivolous appeals (only when escrow succeeded).
+            if escrow_ok {
+                if let Some(reputation_contract) = env
                     .storage()
                     .instance()
-                    .get(&DataKey::ReputationSlashBps)
-                    .unwrap_or(DEFAULT_REPUTATION_SLASH_BPS);
+                    .get::<DataKey, Address>(&DataKey::ReputationContract)
+                {
+                    let loser = match resolution {
+                        DisputeResolution::ClientWins => dispute.freelancer.clone(),
+                        DisputeResolution::FreelancerWins => dispute.client.clone(),
+                        _ => ap.appellant.clone(),
+                    };
 
-                let current_score = env
-                    .try_invoke_contract::<reputation::UserReputation, soroban_sdk::Error>(
+                    let slash_bps: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::ReputationSlashBps)
+                        .unwrap_or(DEFAULT_REPUTATION_SLASH_BPS);
+
+                    let current_score = env
+                        .try_invoke_contract::<reputation::UserReputation, soroban_sdk::Error>(
+                            &reputation_contract,
+                            &Symbol::new(&env, "get_reputation"),
+                            vec![&env, loser.clone().into_val(&env)],
+                        )
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .map(|r| r.total_score)
+                        .unwrap_or(0);
+
+                    // Double the slash rate for appeals.
+                    let double_bps = slash_bps.saturating_mul(2);
+                    let mut slash_amount: u64 =
+                        (current_score.saturating_mul(double_bps as u64)) / 10_000;
+                    if slash_amount == 0 && current_score > 0 {
+                        slash_amount = 1;
+                    }
+
+                    let reason = String::from_str(&env, "appeal_lost");
+                    let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                         &reputation_contract,
-                        &Symbol::new(&env, "get_reputation"),
-                        vec![&env, loser.clone().into_val(&env)],
-                    )
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .map(|r| r.total_score)
-                    .unwrap_or(0);
+                        &Symbol::new(&env, "slash_reputation"),
+                        vec![
+                            &env,
+                            loser.clone().into_val(&env),
+                            dispute.job_id.into_val(&env),
+                            slash_amount.into_val(&env),
+                            reason.into_val(&env),
+                        ],
+                    );
 
-                // Double the slash rate for appeals.
-                let double_bps = slash_bps.saturating_mul(2);
-                let mut slash_amount: u64 =
-                    (current_score.saturating_mul(double_bps as u64)) / 10_000;
-                if slash_amount == 0 && current_score > 0 {
-                    slash_amount = 1;
+                    env.events().publish(
+                        (symbol_short!("dispute"), Symbol::new(&env, "ap_slashed")),
+                        (ap.id, loser, slash_amount),
+                    );
                 }
-
-                let reason = String::from_str(&env, "appeal_lost");
-                let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
-                    &reputation_contract,
-                    &Symbol::new(&env, "slash_reputation"),
-                    vec![
-                        &env,
-                        loser.clone().into_val(&env),
-                        dispute.job_id.into_val(&env),
-                        slash_amount.into_val(&env),
-                        reason.into_val(&env),
-                    ],
-                );
-
-                env.events().publish(
-                    (symbol_short!("dispute"), Symbol::new(&env, "ap_slashed")),
-                    (ap.id, loser, slash_amount),
-                );
             }
         }
 
@@ -1682,6 +1737,73 @@ impl DisputeContract {
             .persistent()
             .get(&DataKey::Votes(dispute_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Submit evidence for an active dispute.
+    ///
+    /// Only the client or freelancer involved in the dispute may submit evidence.
+    /// The dispute must be in `Open` or `Voting` status.
+    /// Emits `EvidenceSubmitted` so indexers can track evidence without polling storage.
+    pub fn submit_evidence(
+        env: Env,
+        dispute_id: u64,
+        submitted_by: Address,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), DisputeError> {
+        submitted_by.require_auth();
+        require_not_paused(&env)?;
+
+        let dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .ok_or(DisputeError::DisputeNotFound)?;
+        bump_dispute_ttl(&env, dispute_id);
+
+        if dispute.status != DisputeStatus::Open && dispute.status != DisputeStatus::Voting {
+            return Err(DisputeError::VotingClosed);
+        }
+
+        if submitted_by != dispute.client && submitted_by != dispute.freelancer {
+            return Err(DisputeError::InvalidParty);
+        }
+
+        let record = EvidenceRecord {
+            submitted_by: submitted_by.clone(),
+            evidence_hash: evidence_hash.clone(),
+            ledger: env.ledger().sequence(),
+        };
+
+        let mut evidence: Vec<EvidenceRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Evidence(dispute_id))
+            .unwrap_or(Vec::new(&env));
+        evidence.push_back(record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Evidence(dispute_id), &evidence);
+        bump_evidence_ttl(&env, dispute_id);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("evidence")),
+            (dispute_id, submitted_by, evidence_hash, env.ledger().sequence()),
+        );
+
+        Ok(())
+    }
+
+    /// Get all evidence submitted for a dispute.
+    pub fn get_evidence(env: Env, dispute_id: u64) -> Vec<EvidenceRecord> {
+        let evidence = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Evidence(dispute_id))
+            .unwrap_or(Vec::new(&env));
+        if !evidence.is_empty() {
+            bump_evidence_ttl(&env, dispute_id);
+        }
+        evidence
     }
 
     /// Get all arbitrators (voters) who have voted on a dispute.
@@ -1933,6 +2055,90 @@ impl DisputeContract {
             .get(&DataKey::ArbitratorPool)
             .unwrap_or(Vec::new(&env))
     }
+
+    /// Retry the escrow callback for a dispute whose resolution previously failed.
+    ///
+    /// Permissionless and idempotent: safe to call repeatedly until escrow accepts.
+    /// Returns the current dispute status so callers can see whether the retry succeeded.
+    pub fn retry_escrow_callback(env: Env, dispute_id: u64) -> Result<DisputeStatus, DisputeError> {
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(dispute_id))
+            .ok_or(DisputeError::DisputeNotFound)?;
+        bump_dispute_ttl(&env, dispute_id);
+
+        if dispute.status != DisputeStatus::ResolutionFailed {
+            return Err(DisputeError::AlreadyResolved);
+        }
+
+        let resolution: DisputeResolution = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingResolution(dispute_id))
+            .ok_or(DisputeError::DisputeNotFound)?;
+        bump_pending_resolution_ttl(&env, dispute_id);
+
+        let escrow_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .ok_or(DisputeError::NotInitialized)?;
+
+        let escrow_ok = matches!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &escrow_addr,
+                &Symbol::new(&env, "resolve_dispute_callback"),
+                vec![&env, dispute.job_id.into_val(&env), resolution.clone().into_val(&env)],
+            ),
+            Ok(Ok(_))
+        );
+
+        if !escrow_ok {
+            env.events().publish(
+                (symbol_short!("dispute"), Symbol::new(&env, "escrow_fail")),
+                (dispute_id, dispute.job_id),
+            );
+            return Ok(DisputeStatus::ResolutionFailed);
+        }
+
+        dispute.status = resolution_to_status(&resolution);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingResolution(dispute_id));
+
+        env.storage().persistent().set(
+            &DataKey::LastDisputeClosedAt(dispute.job_id),
+            &env.ledger().timestamp(),
+        );
+        bump_last_dispute_closed_ttl(&env, dispute.job_id);
+
+        env.storage().persistent().set(
+            &DataKey::LastDisputeLedger(dispute.client.clone(), dispute.freelancer.clone()),
+            &env.ledger().timestamp(),
+        );
+        bump_last_dispute_ledger_ttl(&env, &dispute.client, &dispute.freelancer);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id), &dispute);
+        bump_dispute_ttl(&env, dispute_id);
+
+        env.events().publish(
+            (symbol_short!("dispute"), symbol_short!("resolved")),
+            (
+                dispute_id,
+                dispute.status.clone(),
+                dispute.job_id,
+                dispute.client.clone(),
+                dispute.freelancer.clone(),
+                resolution,
+            ),
+        );
+
+        Ok(dispute.status.clone())
+    }
 }
 
 /// Returns the median client_bps from all SplitAward votes using insertion sort.
@@ -1958,6 +2164,18 @@ fn compute_median_bps(env: &Env, votes: &Vec<Vote>) -> u32 {
     sorted.get(n / 2).unwrap()
 }
 
+fn resolution_to_status(resolution: &DisputeResolution) -> DisputeStatus {
+    match resolution {
+        DisputeResolution::ClientWins => DisputeStatus::ResolvedForClient,
+        DisputeResolution::FreelancerWins => DisputeStatus::ResolvedForFreelancer,
+        DisputeResolution::RefundBoth => DisputeStatus::RefundedBoth,
+        DisputeResolution::RefundSplit(pct) => DisputeStatus::RefundSplit(*pct),
+        DisputeResolution::SplitAward(bps) => DisputeStatus::SplitAward(*bps),
+        DisputeResolution::MaliciousFiling => DisputeStatus::MaliciousDisputeFiling,
+        DisputeResolution::Escalate => DisputeStatus::Escalated,
+    }
+}
+
 fn internal_resolve(
     env: &Env,
     dispute_id: u64,
@@ -1972,6 +2190,7 @@ fn internal_resolve(
         || matches!(dispute.status, DisputeStatus::SplitAward(_))
         || dispute.status == DisputeStatus::Escalated
         || dispute.status == DisputeStatus::MaliciousDisputeFiling
+        || dispute.status == DisputeStatus::ResolutionFailed
     {
         return Err(DisputeError::AlreadyResolved);
     }
@@ -1995,15 +2214,35 @@ fn internal_resolve(
         dispute.status = DisputeStatus::MaliciousDisputeFiling;
 
         // Notify escrow: slash full stake of initiator to treasury.
-        env.invoke_contract::<()>(
-            escrow_addr,
-            &Symbol::new(env, "resolve_dispute_callback"),
-            vec![
-                env,
-                dispute.job_id.into_val(env),
-                DisputeResolution::MaliciousFiling.into_val(env),
-            ],
+        let escrow_ok = matches!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                escrow_addr,
+                &Symbol::new(env, "resolve_dispute_callback"),
+                vec![
+                    env,
+                    dispute.job_id.into_val(env),
+                    DisputeResolution::MaliciousFiling.into_val(env),
+                ],
+            ),
+            Ok(Ok(_))
         );
+
+        if !escrow_ok {
+            dispute.status = DisputeStatus::ResolutionFailed;
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingResolution(dispute_id), &DisputeResolution::MaliciousFiling);
+            bump_pending_resolution_ttl(env, dispute_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id), &*dispute);
+            bump_dispute_ttl(env, dispute_id);
+            env.events().publish(
+                (symbol_short!("dispute"), Symbol::new(env, "escrow_fail")),
+                (dispute_id, dispute.job_id),
+            );
+            return Ok(DisputeStatus::ResolutionFailed);
+        }
 
         // Cross-contract call to reputation contract: apply MaliciousFiling penalty.
         if let Some(reputation_contract) = env
@@ -2123,11 +2362,31 @@ fn internal_resolve(
 
     // Only invoke the escrow callback if the dispute has a concrete resolution.
     if resolution != DisputeResolution::Escalate {
-        env.invoke_contract::<()>(
-            escrow_addr,
-            &Symbol::new(env, "resolve_dispute_callback"),
-            vec![env, dispute.job_id.into_val(env), resolution.into_val(env)],
+        let escrow_ok = matches!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                escrow_addr,
+                &Symbol::new(env, "resolve_dispute_callback"),
+                vec![env, dispute.job_id.into_val(env), resolution.clone().into_val(env)],
+            ),
+            Ok(Ok(_))
         );
+
+        if !escrow_ok {
+            dispute.status = DisputeStatus::ResolutionFailed;
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingResolution(dispute_id), &resolution);
+            bump_pending_resolution_ttl(env, dispute_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id), &*dispute);
+            bump_dispute_ttl(env, dispute_id);
+            env.events().publish(
+                (symbol_short!("dispute"), Symbol::new(env, "escrow_fail")),
+                (dispute_id, dispute.job_id),
+            );
+            return Ok(DisputeStatus::ResolutionFailed);
+        }
 
         // Slash the losing party's reputation score.
         if let Some(reputation_contract) = env

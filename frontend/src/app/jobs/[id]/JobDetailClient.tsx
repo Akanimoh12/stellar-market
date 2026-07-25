@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useParams } from "next/navigation";
 import { useQuery, useQueryClient, useInfiniteQuery } from "@tanstack/react-query";
 import {
@@ -23,6 +23,7 @@ import axios from "axios";
 import { useWallet } from "@/context/WalletContext";
 import { useAuth } from "@/context/AuthContext";
 import { PAYMENT_TOKENS, TOKEN_EXCHANGE_RATES } from "@/constants/jobs";
+import { useFocusTrap } from "@/hooks/useFocusTrap";
 import StatusBadge from "@/components/StatusBadge";
 import ApplyModal from "@/components/ApplyModal";
 import RaiseDisputeModal from "@/components/RaiseDisputeModal";
@@ -78,6 +79,29 @@ type PendingOnChainAction = {
     agreedValueStroops: string;
     maxSlippageBps: number;
   };
+};
+
+// Only the confirmTypes that actually move funds are tracked with the
+// backend's transaction-status endpoint (see WalletContext.signAndBroadcastTransaction),
+// since the Transaction model's `type` column is also used for the user-facing
+// financial transaction history and shouldn't be populated with non-monetary
+// actions (e.g. CREATE_JOB, PROPOSE_REVISION) under a misleading DEPOSIT/RELEASE/REFUND label.
+const MONEY_MOVING_TX_TYPE: Partial<
+  Record<PendingOnChainAction["confirmType"], "DEPOSIT" | "RELEASE" | "REFUND">
+> = {
+  FUND_JOB: "DEPOSIT",
+  APPROVE_MILESTONE: "RELEASE",
+  CANCEL_JOB: "REFUND",
+  CLAIM_REFUND: "REFUND",
+};
+
+// Endpoints that produce a fresh unsigned XDR for a given confirmType, reused
+// both for the initial build and to rebuild after an EXPIRED (canRetry) result.
+const CONFIRM_TYPE_ENDPOINT: Partial<Record<PendingOnChainAction["confirmType"], string>> = {
+  FUND_JOB: "/escrow/init-fund",
+  APPROVE_MILESTONE: "/escrow/init-approve",
+  CANCEL_JOB: "/escrow/init-cancel",
+  CLAIM_REFUND: "/escrow/init-refund",
 };
 
 export default function JobDetailClient() {
@@ -217,6 +241,8 @@ export default function JobDetailClient() {
   const [disputeModalOpen, setDisputeModalOpen] = useState(false);
   const [reviewModalOpen, setReviewModalOpen] = useState(false);
   const [withdrawConfirmOpen, setWithdrawConfirmOpen] = useState(false);
+  const withdrawConfirmRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(withdrawConfirmRef, { open: withdrawConfirmOpen, onClose: () => setWithdrawConfirmOpen(false) });
   const [withdrawing, setWithdrawing] = useState(false);
   const [actioningApp, setActioningApp] = useState<string | null>(null);
   const [proposeRevisionOpen, setProposeRevisionOpen] = useState(false);
@@ -324,6 +350,27 @@ export default function JobDetailClient() {
     }
   };
 
+  const rebuildXdrForAction = async (
+    action: PendingOnChainAction,
+    authToken: string | null,
+  ): Promise<string> => {
+    const endpoint = CONFIRM_TYPE_ENDPOINT[action.confirmType];
+    if (!endpoint) {
+      throw new Error("This action cannot be automatically retried.");
+    }
+    const payload: Record<string, unknown> =
+      action.confirmType === "FUND_JOB"
+        ? { jobId: id, paymentToken: selectedPaymentToken }
+        : action.confirmType === "APPROVE_MILESTONE"
+          ? { milestoneId: action.milestoneId }
+          : { jobId: id };
+
+    const res = await axios.post(`${API_URL}${endpoint}`, payload, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    return res.data.xdr;
+  };
+
   const confirmPendingOnChainAction = async (preparedXdr: string) => {
     if (!pendingOnChainAction) return;
 
@@ -336,7 +383,22 @@ export default function JobDetailClient() {
 
     try {
       const token = localStorage.getItem("token");
-      const txResult = await signAndBroadcastTransaction(preparedXdr);
+      const txType = MONEY_MOVING_TX_TYPE[action.confirmType];
+      const meta = txType
+        ? { type: txType, jobId: String(id), milestoneId: action.milestoneId }
+        : undefined;
+
+      let xdrToSend = preparedXdr;
+      let txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+
+      if (!txResult.success && txResult.canRetry && meta) {
+        // Transaction's ledger deadline passed before it was included — the
+        // original sequence number is no longer usable. Rebuild against the
+        // same init endpoint (which always fetches the account's current
+        // sequence number) and resubmit once.
+        xdrToSend = await rebuildXdrForAction(action, token);
+        txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+      }
 
       if (!txResult.success) {
         throw new Error(txResult.error || "Transaction failed");
@@ -600,13 +662,24 @@ export default function JobDetailClient() {
         throw new Error("Please log in again.");
       }
 
-      const res = await axios.put(
-        `${API_URL}/milestones/${milestoneId}/approve`,
-        {},
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
+      const fetchApproveXdr = async () => {
+        const r = await axios.put(
+          `${API_URL}/milestones/${milestoneId}/approve`,
+          {},
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
+        return r.data.xdr as string;
+      };
 
-      const txResult = await signAndBroadcastTransaction(res.data.xdr);
+      const meta = { type: "RELEASE" as const, jobId: String(id), milestoneId };
+      let xdrToSend = await fetchApproveXdr();
+      let txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+
+      if (!txResult.success && txResult.canRetry) {
+        xdrToSend = await fetchApproveXdr();
+        txResult = await signAndBroadcastTransaction(xdrToSend, meta);
+      }
+
       if (!txResult.success) {
         throw new Error(txResult.error || "Transaction failed");
       }
@@ -1535,7 +1608,7 @@ export default function JobDetailClient() {
       {/* Withdraw Application confirmation dialog */}
       {withdrawConfirmOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
+          <div ref={withdrawConfirmRef} className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
             <h2 className="text-lg font-semibold text-theme-heading mb-2">
               Withdraw Application?
             </h2>
