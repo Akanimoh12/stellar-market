@@ -91,6 +91,20 @@ pub enum EscrowError {
     MilestoneDeadlinesNotOrdered = 47,
     /// A milestone deadline is in the past or equal to the current ledger timestamp.
     MilestoneDeadlineInPast = 49,
+    /// A revision proposal would drop a milestone that already has disbursed funds,
+    /// or would value it below what has already been paid out to the freelancer.
+    RevisionBelowDisbursedAmount = 50,
+
+    // ===== Reputation-weighted governance (issue #899) =====
+    // The governance proposal lifecycle has its own dedicated `GovError` enum in
+    // `governance.rs` (the SDK caps a single error enum at 50 cases). Only this
+    // one variant lives here, because it is returned from the multisig code path
+    // (`propose_admin_action` / `execute_proposal_internal`) to enforce the
+    // governance/multisig separation of powers. Code 51 (not 50) — code 50 is
+    // taken by RevisionBelowDisbursedAmount, which landed on main after this
+    // branch opened.
+    /// A governed parameter must be changed via governance, not the multisig.
+    GovernanceRequired = 51,
 }
 
 /// Privileged actions that can be proposed and approved through the multi-sig flow.
@@ -272,7 +286,7 @@ pub struct Job {
     pub expiry_ledger: u32,
 }
 
-const MAX_FEE_BPS: u32 = 500; // 5%
+pub(crate) const MAX_FEE_BPS: u32 = 500; // 5%
 const MAX_MILESTONES: u32 = 50;
 
 /// A formal proposal to revise the milestones and total budget of an active job.
@@ -345,6 +359,11 @@ enum DataKey {
     Nonce(Address, Symbol, u64),
     /// Registered dispute contract — the only address allowed to call mark_job_disputed.
     DisputeContract,
+    /// Cumulative amount (i128) already paid out to the freelancer for a given
+    /// (job_id, milestone_id), via `release_partial_payment` or `release_milestone`.
+    /// Used by `accept_revision` to ensure a revision never shrinks a milestone's
+    /// value below funds that have already left escrow for it.
+    MilestoneDisbursed(u64, u32),
 }
 
 /// Fixed-point scale for oracle prices: prices are quoted in XLM stroops per token
@@ -368,6 +387,26 @@ const NONCE_EXPIRY_LEDGERS: u32 = 3;
 
 fn get_job_key(job_id: u64) -> DataKey {
     DataKey::Job(job_id)
+}
+
+/// Cumulative amount already disbursed to the freelancer for a given milestone,
+/// across `release_partial_payment` and `release_milestone` calls.
+fn get_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MilestoneDisbursed(job_id, milestone_id))
+        .unwrap_or(0)
+}
+
+/// Records that `amount` additional tokens have just been paid out to the freelancer
+/// for `milestone_id`, so later revisions can't retroactively undercut it.
+fn record_milestone_disbursed(env: &Env, job_id: u64, milestone_id: u32, amount: i128) {
+    let key = DataKey::MilestoneDisbursed(job_id, milestone_id);
+    let existing: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    env.storage().persistent().set(&key, &existing.saturating_add(amount));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
 }
 
 fn consume_nonce(env: &Env, caller: &Address, function: &Symbol, nonce: u64) -> Result<(), EscrowError> {
@@ -859,6 +898,13 @@ impl EscrowContract {
             return Err(EscrowError::SignerNotFound);
         }
 
+        // Reject governed parameter changes up front once governance is enabled,
+        // so the multisig cannot even queue a proposal that governance owns.
+        // Execution is guarded independently in `execute_proposal_internal`.
+        if governance::governance_enabled(&env) && governance::is_governable_action(&action) {
+            return Err(EscrowError::GovernanceRequired);
+        }
+
         let mut count: u64 = env
             .storage()
             .instance()
@@ -1015,6 +1061,18 @@ impl EscrowContract {
             .unwrap_or(proposal.created_at);
         if env.ledger().timestamp() < not_before {
             return Err(EscrowError::ProposalTimeLockActive);
+        }
+
+        // Governance/multisig separation of powers (issue #899): once governance
+        // is configured, protocol-parameter changes (fee, treasury) are the
+        // exclusive domain of the reputation-weighted governance path. The
+        // multisig retains only operational/emergency powers and its own signer
+        // set. This guard makes the boundary explicit and un-bypassable — a
+        // signer majority cannot quietly override a governance decision on a
+        // governed parameter.
+        if governance::governance_enabled(env) && governance::is_governable_action(&proposal.action)
+        {
+            return Err(EscrowError::GovernanceRequired);
         }
 
         match proposal.action.clone() {
@@ -2110,6 +2168,10 @@ impl EscrowContract {
             &amount,
         );
 
+        // Track cumulative disbursement so a later revision can't undercut what's
+        // already been paid out for this milestone.
+        record_milestone_disbursed(&env, job_id, milestone.id, amount);
+
         // Deduct paid amount from milestone; transition status accordingly.
         let remaining = milestone.amount - amount;
         let new_status = if remaining == 0 {
@@ -2344,6 +2406,10 @@ impl EscrowContract {
             &job.freelancer,
             &freelancer_amount,
         );
+
+        // Track cumulative disbursement (full nominal milestone amount — fee included —
+        // since that value has left escrow for good) so a later revision can't undercut it.
+        record_milestone_disbursed(&env, job_id, milestone.id, milestone.amount);
 
         let updated = Milestone {
             id: milestone.id,
@@ -2691,6 +2757,9 @@ impl EscrowContract {
     /// * `RevisionProposalAlreadyExists` — if a Pending proposal already exists
     /// * `EmptyMilestonesProposed` — if new_milestones is empty
     /// * `ProposalTotalMismatch` — if sum of milestone amounts does not equal computed new_total
+    /// * `InvalidStatus` — if the job is Disputed or in any terminal state (Completed,
+    ///   Cancelled, Expired) — the revision flow assumes the job is still actively in
+    ///   progress with nothing finalized
     pub fn propose_revision(
         env: Env,
         caller: Address,
@@ -2716,10 +2785,12 @@ impl EscrowContract {
         }
 
         // Freeze revisions while a dispute is active so later dispute
-        // resolution still operates on the original milestone set and total.
-        if job.status == JobStatus::Disputed {
-            return Err(EscrowError::InvalidStatus);
-        }
+        // resolution still operates on the original milestone set and total, and
+        // reject on any terminal state (Completed, Cancelled, Expired) — the whole
+        // revision flow assumes the job is still actively in progress and nothing
+        // has been finalized yet.
+        require_state_not_terminal(&job)?;
+        require_state_not_disputed(&job)?;
 
         // 3. Assert no existing Pending proposal, allowing overwrite of expired ones
         if let Some(existing) = env
@@ -2799,17 +2870,26 @@ impl EscrowContract {
     /// * `job_id` — The job whose proposal is being accepted
     ///
     /// # Behavior
-    /// ## If new_total > old_total (budget increase):
+    /// The top-up/refund transfer is computed against `job.funded_amount` — the actual
+    /// escrowed balance — rather than the nominal `job.total_amount`, so it always
+    /// reconciles the real contract balance to `new_total` regardless of prior
+    /// disbursements or funding drift:
+    ///
+    /// ## If new_total > funded_amount (budget increase):
     ///   - The difference is required from the client as a top-up
     ///   - Caller (if client) must have pre-authorized the token transfer
-    ///   - The contract transfers (new_total - old_total) from client to itself
+    ///   - The contract transfers (new_total - funded_amount) from client to itself
     ///
-    /// ## If new_total < old_total (budget decrease):
+    /// ## If new_total < funded_amount (budget decrease):
     ///   - The difference is refunded to the client immediately
-    ///   - The contract transfers (old_total - new_total) from itself to client
+    ///   - The contract transfers (funded_amount - new_total) from itself to client
     ///
-    /// ## If new_total == old_total (no budget change):
+    /// ## If new_total == funded_amount (no budget change):
     ///   - Only milestone structure changes — no token movement occurs
+    ///
+    /// A revision can never reduce `new_total` below funds already disbursed to the
+    /// freelancer (see `RevisionBelowDisbursedAmount` below), which guarantees the
+    /// refund path never tries to claw back more than the job's real remaining balance.
     ///
     /// ## Revision History:
     ///   - Before overwriting, the current milestone structure is snapshotted
@@ -2819,7 +2899,12 @@ impl EscrowContract {
     /// * `RevisionProposalNotFound` — if no proposal exists for this job
     /// * `ProposalNotPending` — if the proposal is not in Pending status
     /// * `NotAuthorizedForProposalAction` — if caller is the proposer or not a party
-    /// * `InsufficientTopUp` — if new_total > old_total and top-up transfer fails
+    /// * `InvalidStatus` — if the job is Disputed or in a terminal state (Completed,
+    ///   Cancelled, Expired), which can happen if the job changed state after the
+    ///   proposal was created but before it was accepted
+    /// * `RevisionBelowDisbursedAmount` — if the proposal drops a milestone that already
+    ///   has disbursed funds, or values it below what's already been paid out
+    /// * `InsufficientTopUp` — if new_total > funded_amount and top-up transfer fails
     pub fn accept_revision(env: Env, caller: Address, job_id: u64) -> Result<(), EscrowError> {
         bump_escrow_ttl(&env, job_id);
         require_not_paused(&env)?;
@@ -2853,6 +2938,30 @@ impl EscrowContract {
             return Err(EscrowError::NotAuthorizedForProposalAction);
         }
 
+        // The job may have moved into a dispute or a terminal state after the proposal
+        // was created but before it was accepted — re-check here, right before mutating
+        // anything, rather than trusting the state that held at propose time.
+        require_state_not_terminal(&job)?;
+        require_state_not_disputed(&job)?;
+
+        // Guard against a revision silently erasing money already paid to the freelancer:
+        // for every existing milestone that has disbursed funds (via release_partial_payment
+        // or release_milestone), the proposal must still carry that milestone id with a
+        // value at least equal to what's already been paid out.
+        for old_milestone in job.milestones.iter() {
+            let disbursed = get_milestone_disbursed(&env, job_id, old_milestone.id);
+            if disbursed <= 0 {
+                continue;
+            }
+            let still_covered = proposal
+                .new_milestones
+                .iter()
+                .any(|m| m.id == old_milestone.id && m.amount >= disbursed);
+            if !still_covered {
+                return Err(EscrowError::RevisionBelowDisbursedAmount);
+            }
+        }
+
         // 4. Snapshot current milestones to revision history BEFORE overwriting
         let mut history: Vec<MilestoneRevision> = env
             .storage()
@@ -2880,10 +2989,14 @@ impl EscrowContract {
             TTL_EXTEND_TO_LEDGERS,
         );
 
-        // 5. Compute balance delta
-        let old_total = job.total_amount;
+        // 5. Compute balance delta from the job's actual funded (escrowed) balance —
+        // not from the nominal `total_amount` — so the transfer always reconciles the
+        // real contract balance to the new agreed total, even if `funded_amount` had
+        // drifted from `total_amount` (e.g. a job funded incrementally via
+        // `top_up_escrow`). This is what actually moves tokens below, so it must be
+        // grounded in what's really sitting in escrow rather than a stale nominal figure.
         let new_total = proposal.new_total;
-        let delta = new_total - old_total; // positive = increase, negative = decrease, zero = unchanged
+        let delta = new_total - job.funded_amount; // positive = increase, negative = decrease, zero = unchanged
 
         // 6. Handle escrow balance adjustment
         let token_client = token::Client::new(&env, &job.token);
@@ -2911,8 +3024,38 @@ impl EscrowContract {
         }
         // delta == 0: no token movement needed
 
-        // 7. Update job milestones and total
-        job.milestones = proposal.new_milestones.clone();
+        // 7. Update job milestones and total. For any milestone id that already carries
+        // disbursed funds, rebase the incoming entry onto the real remaining balance
+        // (new nominal value minus what's already been paid) instead of trusting the
+        // proposer's raw entry verbatim — otherwise a later release could pay out the
+        // full new amount on top of funds already sent to the freelancer.
+        let mut final_milestones: Vec<Milestone> = Vec::new(&env);
+        for new_milestone in proposal.new_milestones.iter() {
+            let was_existing = job.milestones.iter().any(|old| old.id == new_milestone.id);
+            let disbursed = if was_existing {
+                get_milestone_disbursed(&env, job_id, new_milestone.id)
+            } else {
+                0
+            };
+            if disbursed > 0 {
+                let remaining = new_milestone.amount - disbursed; // >= 0, enforced above
+                let (status, amount) = if remaining <= 0 {
+                    (MilestoneStatus::Approved, 0)
+                } else {
+                    (MilestoneStatus::PartiallyPaid, remaining)
+                };
+                final_milestones.push_back(Milestone {
+                    id: new_milestone.id,
+                    description: new_milestone.description.clone(),
+                    amount,
+                    status,
+                    deadline: new_milestone.deadline,
+                });
+            } else {
+                final_milestones.push_back(new_milestone.clone());
+            }
+        }
+        job.milestones = final_milestones;
         job.total_amount = new_total;
 
         // 8. Persist updated job
@@ -3407,8 +3550,14 @@ impl EscrowContract {
     }
 }
 
+/// Reputation-weighted on-chain governance for protocol parameters (issue #899).
+mod governance;
+
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
 mod fuzz;
+
+#[cfg(test)]
+mod governance_test;
