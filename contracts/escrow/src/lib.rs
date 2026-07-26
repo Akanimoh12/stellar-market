@@ -1360,6 +1360,14 @@ impl EscrowContract {
 
         client.require_auth();
 
+        // Self-employment escrows (client == freelancer) are not allowed: a user
+        // controlling both addresses could artificially generate review-eligible
+        // jobs. `EscrowError` is at the SDK's 50-variant cap, so this reuses
+        // `Unauthorized` rather than adding a new variant.
+        if client == freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+
         if job_deadline <= env.ledger().timestamp() {
             return Err(EscrowError::InvalidDeadline);
         }
