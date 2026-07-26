@@ -1751,6 +1751,13 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
+        // Multi-token jobs are always fully funded in one shot by fund_job, so there
+        // is no legitimate top-up path for them. Guard explicitly so this stays true
+        // even if revision support or other total_amount-raising paths are later added.
+        if !job.token_balances.is_empty() {
+            return Err(EscrowError::InvalidStatus);
+        }
+
         // STATE VALIDATION: Job must be Funded or InProgress to top up
         require_state_funded_or_in_progress(&job)?;
 
