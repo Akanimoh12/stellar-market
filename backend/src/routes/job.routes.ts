@@ -7,6 +7,7 @@ import { AppError } from "../errors/AppError";
 import { ErrorCodes } from "../errors/codes";
 import { logger } from "../lib/logger";
 import { RecommendationQueueService } from "../services/recommendation-queue.service";
+import { FraudDetectionService } from "../services/fraud-detection.service";
 import {
   createJobSchema,
   updateJobSchema,
@@ -851,6 +852,10 @@ router.post(
 
     await invalidateCache("jobs:list:*");
     void RecommendationQueueService.enqueueRebuild(job.id);
+
+    // Near-real-time fraud/anomaly scoring (issue #900). Fire-and-forget: this
+    // never blocks or fails job creation.
+    FraudDetectionService.onJobCreated(job.id, req.userId!);
 
     try {
       const { getIo } = await import("../socket");
