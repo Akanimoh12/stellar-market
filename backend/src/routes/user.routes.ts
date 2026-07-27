@@ -13,7 +13,7 @@ import { PrismaClient } from "@prisma/client";
 import { asyncHandler } from "../middleware/error";
 import { avatarUpload } from "../config/upload";
 import { validate } from "../middleware/validation";
-import { ReputationService } from "../services/reputation.service";
+import { ReputationCacheService } from "../services/reputation-cache.service";
 import { normalizeSkills } from "../services/skill.service";
 import { logger } from "../lib/logger";
 import sharp from "sharp";
@@ -475,7 +475,7 @@ router.get(
         }
 
         if (user.role === "FREELANCER" && user.walletAddress) {
-          const reputation = await ReputationService.getReputation(user.walletAddress);
+          const reputation = await ReputationCacheService.getCachedReputation(user.walletAddress);
           if (reputation) {
             (user as any).reputation = {
               totalScore: reputation.total_score.toString(),
@@ -553,7 +553,7 @@ router.get(
     const usersWithReputation = await Promise.all(
       users.map(async (user: any) => {
         if (user.role === "FREELANCER" && user.walletAddress) {
-          const reputation = await ReputationService.getReputation(user.walletAddress);
+          const reputation = await ReputationCacheService.getCachedReputation(user.walletAddress);
           return {
             ...user,
             reputation: reputation ? {
@@ -614,7 +614,22 @@ router.put(
 
     const body = updateData as Record<string, unknown>;
     const data: Record<string, unknown> = {};
-    if (body.email !== undefined) data.email = body.email;
+    if (body.email !== undefined) {
+      data.email = body.email;
+      
+      // Check email uniqueness if being updated
+      if (body.email) {
+        const existingUser = await prisma.user.findFirst({
+          where: {
+            email: body.email as string,
+            NOT: { id },
+          },
+        });
+        if (existingUser) {
+          return res.status(409).json({ error: "Email is already taken." });
+        }
+      }
+    }
     if (body.bio !== undefined) data.bio = body.bio;
     if (body.skills !== undefined) data.skills = body.skills;
     if (body.availability !== undefined) data.availability = body.availability;
