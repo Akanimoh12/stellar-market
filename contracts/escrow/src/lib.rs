@@ -814,6 +814,8 @@ impl EscrowContract {
     }
 
     pub fn add_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+
         admin.require_auth();
         if !is_signer(&env, &admin) {
             return Err(EscrowError::NotAdmin);
@@ -1486,6 +1488,13 @@ impl EscrowContract {
 
         client.require_auth();
 
+        // Self-employment escrows (client == freelancer) are not allowed: a user
+        // controlling both addresses could artificially generate review-eligible
+        // jobs. Same guard as `create_job` (issue #988).
+        if client == freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+
         if job_deadline <= env.ledger().timestamp() {
             return Err(EscrowError::InvalidDeadline);
         }
@@ -1737,6 +1746,7 @@ impl EscrowContract {
     /// - `InvalidStatus`    — job is not Funded or InProgress
     /// - `AlreadyFunded`    — adding `amount` would exceed `total_amount`
     /// - `ContractPaused`   — the contract is paused
+    /// - `InvalidAmount`    — `amount` is zero or negative
     pub fn top_up_escrow(
         env: Env,
         client: Address,
@@ -1747,6 +1757,10 @@ impl EscrowContract {
         require_not_paused(&env)?;
 
         client.require_auth();
+
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
 
         let mut job: Job = env
             .storage()

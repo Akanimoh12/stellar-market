@@ -113,6 +113,10 @@ pub enum ReputationError {
     /// A zero-stake review carries vote weight of 1 even though the reviewer has
     /// no economic skin in the game; the minimum stake weight floor prevents this.
     StakeTooLow = 26,
+    /// Rejected when `endorse` is called with `endorser == target`. Without this
+    /// guard, a user with an established rating could add themselves as their
+    /// own skill endorser and inflate their own `get_skill_score` (issue #987).
+    SelfEndorsement = 27,
 }
 
 #[contracttype]
@@ -356,6 +360,10 @@ const MAX_DECAY_RATE_HARD_CEILING: u32 = 50;
 const MIN_TTL_THRESHOLD: u32 = 50_000_000;
 const MIN_TTL_EXTEND_TO: u32 = 50_000_000;
 const APPEAL_GRACE_WINDOW_SECONDS: u64 = 72 * 60 * 60;
+// Bounds how many endorsers `get_skill_score` sums over. Without a cap, the
+// `SkillEndorsers` list (and therefore the loop's cost and the returned
+// score) could grow without limit (issue #987).
+const MAX_ENDORSERS_COUNTED: u32 = 30;
 
 fn bump_reputation_ttl(env: &Env, user: &Address) {
     env.storage().persistent().extend_ttl(
@@ -1741,6 +1749,10 @@ impl ReputationContract {
         endorser.require_auth();
         require_not_paused(&env)?;
 
+        if endorser == target {
+            return Err(ReputationError::SelfEndorsement);
+        }
+
         let key = DataKey::Endorsement(target.clone(), skill.clone(), endorser.clone());
         if env.storage().persistent().has(&key) {
             return Err(ReputationError::AlreadyEndorsed);
@@ -1760,6 +1772,15 @@ impl ReputationContract {
         Ok(())
     }
 
+    /// Compute a user's skill score as the sum, over everyone who has
+    /// endorsed them for `skill`, of each endorser's weight — their
+    /// `get_average_rating() / 100`, or `1` if they have no rating yet.
+    ///
+    /// Security (issue #987): `endorse` rejects `endorser == target`, so a
+    /// user cannot inflate this score by endorsing themselves. The number of
+    /// endorsers summed is additionally capped at `MAX_ENDORSERS_COUNTED` so
+    /// that neither this function's cost nor the score it returns can grow
+    /// without bound as a skill accumulates endorsers.
     pub fn get_skill_score(env: Env, user: Address, skill: String) -> u32 {
         let list_key = DataKey::SkillEndorsers(user.clone(), skill.clone());
         let endorsers: Vec<Address> = env
@@ -1769,7 +1790,7 @@ impl ReputationContract {
             .unwrap_or(Vec::new(&env));
 
         let mut score = 0;
-        for endorser in endorsers.iter() {
+        for endorser in endorsers.iter().take(MAX_ENDORSERS_COUNTED as usize) {
             let avg_rating = Self::get_average_rating(env.clone(), endorser.clone()).unwrap_or(0);
             let weight = if avg_rating > 0 { avg_rating / 100 } else { 1 };
             score += weight as u32;
