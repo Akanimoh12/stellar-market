@@ -13,7 +13,7 @@ import { PrismaClient } from "@prisma/client";
 import { asyncHandler } from "../middleware/error";
 import { avatarUpload } from "../config/upload";
 import { validate } from "../middleware/validation";
-import { ReputationService } from "../services/reputation.service";
+import { ReputationCacheService } from "../services/reputation-cache.service";
 import { normalizeSkills } from "../services/skill.service";
 import { logger } from "../lib/logger";
 import sharp from "sharp";
@@ -475,7 +475,7 @@ router.get(
         }
 
         if (user.role === "FREELANCER" && user.walletAddress) {
-          const reputation = await ReputationService.getReputation(user.walletAddress);
+          const reputation = await ReputationCacheService.getCachedReputation(user.walletAddress);
           if (reputation) {
             (user as any).reputation = {
               totalScore: reputation.total_score.toString(),
@@ -553,7 +553,7 @@ router.get(
     const usersWithReputation = await Promise.all(
       users.map(async (user: any) => {
         if (user.role === "FREELANCER" && user.walletAddress) {
-          const reputation = await ReputationService.getReputation(user.walletAddress);
+          const reputation = await ReputationCacheService.getCachedReputation(user.walletAddress);
           return {
             ...user,
             reputation: reputation ? {
