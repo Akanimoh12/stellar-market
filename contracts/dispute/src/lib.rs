@@ -151,6 +151,10 @@ pub struct EvidenceRecord {
 /// This limit ensures O(1) resolution complexity and prevents instruction limit exceeded errors.
 pub const MAX_ARBITRATORS: u32 = 7;
 
+/// Maximum number of evidence records that can be submitted per dispute.
+/// This prevents unbounded storage growth and excessive TTL-extension costs.
+pub const MAX_EVIDENCE_PER_DISPUTE: u32 = 50;
+
 /// Incremental tally accumulator for O(1) vote counting and verdict finalization.
 /// Instead of iterating over all votes during resolution, we maintain running totals
 /// that are updated in O(1) time during each `cast_vote` operation.
@@ -758,16 +762,7 @@ impl DisputeContract {
     ) -> Result<(), DisputeError> {
         admin.require_auth();
         require_not_paused(&env)?;
-
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(DisputeError::NotInitialized)?;
-
-        if admin != stored_admin {
-            return Err(DisputeError::Unauthorized);
-        }
+        require_admin(&env, &admin)?;
 
         env.storage()
             .instance()
@@ -1102,7 +1097,7 @@ impl DisputeContract {
             VoteChoice::Freelancer => dispute.votes_for_freelancer += 1,
             VoteChoice::RefundSplit(pct_client) => {
                 if pct_client > 100 {
-                    return Err(DisputeError::Unauthorized);
+                    return Err(DisputeError::InvalidSplitBps);
                 }
                 dispute.votes_for_refund_split += 1;
                 dispute.refund_split_sum =
@@ -1461,7 +1456,7 @@ impl DisputeContract {
             VoteChoice::Freelancer => ap.votes_for_freelancer += 1,
             VoteChoice::RefundSplit(pct) => {
                 if pct > 100 {
-                    return Err(DisputeError::Unauthorized);
+                    return Err(DisputeError::InvalidSplitBps);
                 }
                 ap.votes_for_refund_split += 1;
                 ap.refund_split_sum = ap.refund_split_sum.saturating_add(pct as u64);
@@ -1774,17 +1769,30 @@ impl DisputeContract {
             return Err(DisputeError::InvalidParty);
         }
 
+        let mut evidence: Vec<EvidenceRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Evidence(dispute_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Check if evidence count has reached the cap
+        if evidence.len() >= MAX_EVIDENCE_PER_DISPUTE {
+            return Err(DisputeError::Unauthorized);
+        }
+
+        // Check if the evidence hash already exists
+        for existing in evidence.iter() {
+            if existing.evidence_hash == evidence_hash {
+                return Err(DisputeError::Unauthorized);
+            }
+        }
+
         let record = EvidenceRecord {
             submitted_by: submitted_by.clone(),
             evidence_hash: evidence_hash.clone(),
             ledger: env.ledger().sequence(),
         };
 
-        let mut evidence: Vec<EvidenceRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Evidence(dispute_id))
-            .unwrap_or(Vec::new(&env));
         evidence.push_back(record);
         env.storage()
             .persistent()
@@ -1823,10 +1831,15 @@ impl DisputeContract {
     /// Get the assigned arbitrators for a dispute (those assigned via assign_arbitrators).
     /// This is different from get_arbitrators which returns voters who have actually cast votes.
     pub fn get_assigned_arbitrators(env: Env, dispute_id: u64) -> Vec<Address> {
-        env.storage()
+        let arbitrators = env
+            .storage()
             .persistent()
             .get(&DataKey::Arbitrators(dispute_id))
-            .unwrap_or(Vec::<Address>::new(&env))
+            .unwrap_or(Vec::<Address>::new(&env));
+        if !arbitrators.is_empty() {
+            bump_arbitrators_ttl(&env, dispute_id);
+        }
+        arbitrators
     }
 
     /// Get the DisputeTally for O(1) access to vote weights and counts.
