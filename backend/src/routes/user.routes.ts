@@ -614,7 +614,22 @@ router.put(
 
     const body = updateData as Record<string, unknown>;
     const data: Record<string, unknown> = {};
-    if (body.email !== undefined) data.email = body.email;
+    if (body.email !== undefined) {
+      data.email = body.email;
+      
+      // Check email uniqueness if being updated
+      if (body.email) {
+        const existingUser = await prisma.user.findFirst({
+          where: {
+            email: body.email as string,
+            NOT: { id },
+          },
+        });
+        if (existingUser) {
+          return res.status(409).json({ error: "Email is already taken." });
+        }
+      }
+    }
     if (body.bio !== undefined) data.bio = body.bio;
     if (body.skills !== undefined) data.skills = body.skills;
     if (body.availability !== undefined) data.availability = body.availability;
