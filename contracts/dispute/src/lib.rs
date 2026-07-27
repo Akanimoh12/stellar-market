@@ -151,6 +151,13 @@ pub struct EvidenceRecord {
 /// This limit ensures O(1) resolution complexity and prevents instruction limit exceeded errors.
 pub const MAX_ARBITRATORS: u32 = 7;
 
+/// Number of arbitrators randomly assigned to each dispute.
+/// Must be <= MAX_ARBITRATORS.
+pub const ARBITRATORS_PER_DISPUTE: u32 = 5;
+
+/// Number of votes for a single outcome that triggers automatic resolution.
+pub const AUTO_RESOLVE_VOTE_THRESHOLD: u32 = 3;
+
 /// Maximum number of evidence records that can be submitted per dispute.
 /// This prevents unbounded storage growth and excessive TTL-extension costs.
 pub const MAX_EVIDENCE_PER_DISPUTE: u32 = 50;
@@ -894,8 +901,8 @@ impl DisputeContract {
             Vec::<Address>::new(&env)
         };
 
-        // Select 5 random arbitrators for this dispute
-        let assigned_arbitrators = select_arbitrators(&env, count, &excluded_voters, &client, &freelancer, 5);
+        // Select random arbitrators for this dispute
+        let assigned_arbitrators = select_arbitrators(&env, count, &excluded_voters, &client, &freelancer, ARBITRATORS_PER_DISPUTE);
 
         let dispute = Dispute {
             id: count,
@@ -911,7 +918,7 @@ impl DisputeContract {
             refund_split_sum: 0,
             votes_for_malicious: 0,
             votes_for_split_award: 0,
-            min_votes: if min_votes < 3 { 3 } else { min_votes },
+            min_votes: if min_votes < AUTO_RESOLVE_VOTE_THRESHOLD { AUTO_RESOLVE_VOTE_THRESHOLD } else { min_votes },
             tie_break_method: tie_break_method.unwrap_or(TieBreakMethod::RefundBoth),
             created_at: env.ledger().timestamp(),
             voting_deadline: env.ledger().timestamp().saturating_add(VOTING_PERIOD_SECS),
@@ -1181,18 +1188,18 @@ impl DisputeContract {
             (dispute_id, voter.clone(), choice.clone(), dispute.job_id, dispute.client.clone(), dispute.freelancer.clone()),
         );
 
-        // Auto-resolve if 3 votes reached for the same decision (majority threshold)
+        // Auto-resolve if threshold votes reached for the same decision (majority threshold)
         let escrow_addr: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::EscrowContract);
 
         if let Some(escrow) = escrow_addr {
-            if dispute.votes_for_client >= 3
-                || dispute.votes_for_freelancer >= 3
-                || dispute.votes_for_refund_split >= 3
-                || dispute.votes_for_malicious >= 3
-                || dispute.votes_for_split_award >= 3
+            if dispute.votes_for_client >= AUTO_RESOLVE_VOTE_THRESHOLD
+                || dispute.votes_for_freelancer >= AUTO_RESOLVE_VOTE_THRESHOLD
+                || dispute.votes_for_refund_split >= AUTO_RESOLVE_VOTE_THRESHOLD
+                || dispute.votes_for_malicious >= AUTO_RESOLVE_VOTE_THRESHOLD
+                || dispute.votes_for_split_award >= AUTO_RESOLVE_VOTE_THRESHOLD
             {
                 // Auto-resolve the dispute
                 let _ = internal_resolve(&env, dispute_id, &mut dispute, &escrow, false);
@@ -1715,7 +1722,9 @@ impl DisputeContract {
             .persistent()
             .get(&DataKey::JobDisputes(job_id))
             .unwrap_or(Vec::new(&env));
-        bump_job_disputes_ttl(&env, job_id);
+        if !ids.is_empty() {
+            bump_job_disputes_ttl(&env, job_id);
+        }
 
         let mut disputes = Vec::<Dispute>::new(&env);
         for id in ids.iter() {
@@ -2032,12 +2041,13 @@ impl DisputeContract {
     }
 
     /// Remove an arbitrator from the pool (admin only).
+    /// Also excludes them from voting on any open disputes they were assigned to.
     pub fn remove_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), DisputeError> {
         admin.require_auth();
         require_not_paused(&env)?;
         require_admin(&env, &admin)?;
 
-        let mut pool: Vec<Address> = env
+        let pool: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::ArbitratorPool)
@@ -2057,6 +2067,36 @@ impl DisputeContract {
         if removed {
             env.storage().instance().set(&DataKey::ArbitratorPool, &new_pool);
             bump_dispute_count_ttl(&env);
+
+            // Revoke the arbitrator's voting rights on all open disputes they were assigned to.
+            let dispute_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::DisputeCount)
+                .unwrap_or(0);
+
+            for id in 1..=dispute_count {
+                let mut dispute: Dispute = match env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Dispute(id))
+                {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                // Only modify open disputes where the arbitrator is assigned and not yet excluded
+                if dispute.status == DisputeStatus::Open
+                    && dispute.assigned_arbitrators.contains(&arbitrator)
+                    && !dispute.excluded_voters.contains(&arbitrator)
+                {
+                    dispute.excluded_voters.push_back(arbitrator.clone());
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Dispute(id), &dispute);
+                    bump_dispute_ttl(&env, id);
+                }
+            }
 
             env.events().publish(
                 (symbol_short!("dispute"), symbol_short!("arb_rmvd")),
