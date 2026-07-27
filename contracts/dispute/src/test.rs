@@ -135,7 +135,7 @@ fn test_set_min_voter_reputation() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #2)")]
+#[should_panic(expected = "Error(Contract, #12)")]
 fn test_set_min_voter_reputation_non_admin_fails() {
     let env = Env::default();
     env.mock_all_auths();
