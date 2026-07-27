@@ -75,6 +75,23 @@ router.post(
   asyncHandler(async (req: AuthRequest, res: Response) => {
     const { receiverId, jobId, content } = req.body;
 
+    // Verify receiver exists
+    const receiver = await prisma.user.findUnique({ where: { id: receiverId } });
+    if (!receiver) {
+      return res.status(404).json({ error: "Receiver not found." });
+    }
+
+    // If jobId is provided, verify sender is participant
+    if (jobId) {
+      const job = await prisma.job.findUnique({ where: { id: jobId } });
+      if (!job) {
+        return res.status(404).json({ error: "Job not found." });
+      }
+      if (job.clientId !== req.userId && job.freelancerId !== req.userId) {
+        return res.status(403).json({ error: "Not authorized to send messages for this job." });
+      }
+    }
+
     const message = await prisma.message.create({
       data: {
         senderId: req.userId!,
