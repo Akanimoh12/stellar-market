@@ -1515,6 +1515,13 @@ impl DisputeContract {
             return Err(DisputeError::NotEnoughVotes);
         }
 
+        // Overwrite the original dispute's resolution — the appeal is final.
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Dispute(ap.dispute_id))
+            .ok_or(DisputeError::DisputeNotFound)?;
+
         // Determine the appeal outcome by plurality.
         if ap.votes_for_client > ap.votes_for_freelancer
             && ap.votes_for_client > ap.votes_for_refund_split
@@ -1530,7 +1537,12 @@ impl DisputeContract {
             let avg = ap.refund_split_sum / ap.votes_for_refund_split as u64;
             ap.status = AppealStatus::RefundSplit(avg as u32);
         } else {
-            ap.status = AppealStatus::RefundedBoth;
+            match dispute.tie_break_method {
+                TieBreakMethod::FavorClient => ap.status = AppealStatus::ResolvedForClient,
+                TieBreakMethod::FavorFreelancer => ap.status = AppealStatus::ResolvedForFreelancer,
+                TieBreakMethod::RefundBoth => ap.status = AppealStatus::RefundedBoth,
+                TieBreakMethod::Escalate => ap.status = AppealStatus::Escalated,
+            }
         }
 
         let resolution = match ap.status {
@@ -1541,12 +1553,6 @@ impl DisputeContract {
             _ => DisputeResolution::Escalate,
         };
 
-        // Overwrite the original dispute's resolution — the appeal is final.
-        let mut dispute: Dispute = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Dispute(ap.dispute_id))
-            .ok_or(DisputeError::DisputeNotFound)?;
 
         let dispute_outcome = match ap.status {
             AppealStatus::ResolvedForClient => DisputeStatus::ResolvedForClient,
