@@ -4,10 +4,9 @@ import { config } from "../config";
 const ALGORITHM = "aes-256-cbc";
 
 function getKey(): Buffer {
+  // Validation is performed at startup in config/index.ts
+  // This should never throw if the application started successfully
   const hex = config.encryptionKey;
-  if (!hex || hex.length !== 64) {
-    throw new Error("ENCRYPTION_KEY must be a 64-character hex string (32 bytes).");
-  }
   return Buffer.from(hex, "hex");
 }
 
