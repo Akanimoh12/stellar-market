@@ -2813,3 +2813,75 @@ fn test_get_gov_weight_last_change_moves_on_new_review() {
     let (_, second_ts) = client.get_gov_weight(&reviewee);
     assert_eq!(second_ts, 800_000);
 }
+
+#[test]
+fn test_set_stake_tiers_admin_emits_event_and_bumps_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let tiers = vec![
+        &env,
+        StakeTier { threshold: 100_0000000, multiplier: 120 },
+    ];
+
+    client.set_stake_tiers(&admin, &tiers);
+
+    // Verify event is emitted with expected topics and data
+    let events = env.events().all();
+    let mut found_event = false;
+    for event in events.iter() {
+        let (_, topics, data) = event;
+        if topics.len() == 2 {
+            let topic0 = Symbol::try_from_val(&env, &topics.get_unchecked(0)).unwrap();
+            let topic1 = Symbol::try_from_val(&env, &topics.get_unchecked(1)).unwrap();
+            if topic0 == symbol_short!("reput") && topic1 == Symbol::new(&env, "tiers_set") {
+                found_event = true;
+                let event_data: (Address, soroban_sdk::Vec<StakeTier>) = soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
+                assert_eq!(event_data.0, admin);
+                assert_eq!(event_data.1.get_unchecked(0).threshold, 100_0000000);
+                assert_eq!(event_data.1.get_unchecked(0).multiplier, 120);
+            }
+        }
+    }
+    assert!(found_event);
+}
+
+#[test]
+fn test_set_referral_bonus_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    client.set_referral_bonus(&admin, &50u64);
+
+    env.as_contract(&reputation_id, || {
+        let stored_bonus: u64 = env.storage().instance().get(&DataKey::ReferralBonus).unwrap_or(0);
+        assert_eq!(stored_bonus, 50u64);
+    });
+}
+
+#[test]
+#[should_panic]
+fn test_set_referral_bonus_non_signer_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    // Clear auths so the signer check actually fires.
+    env.set_auths(&[]);
+    client.set_referral_bonus(&outsider, &100u64);
+}
