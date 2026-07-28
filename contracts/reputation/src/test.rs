@@ -1628,6 +1628,71 @@ fn test_endorse_weighted_by_endorser_rating() {
     assert_eq!(client.get_skill_score(&target, &skill), 6);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_endorse_self_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let user = Address::generate(&env);
+    let skill = String::from_str(&env, "Rust");
+
+    client.endorse(&user, &user, &skill); // SelfEndorsement #27
+}
+
+#[test]
+fn test_get_skill_score_not_inflated_by_self_endorsement_attempt() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let user = Address::generate(&env);
+    let skill = String::from_str(&env, "Rust");
+
+    // A genuine endorsement from someone else still counts...
+    let other = Address::generate(&env);
+    client.endorse(&other, &user, &skill);
+    assert_eq!(client.get_skill_score(&user, &skill), 1);
+
+    // ...but the user cannot add themselves as an endorser to inflate it further.
+    let result = client.try_endorse(&user, &user, &skill);
+    assert!(result.is_err());
+    assert_eq!(client.get_skill_score(&user, &skill), 1);
+}
+
+#[test]
+fn test_get_skill_score_bounded_by_max_endorsers_counted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // This test drives 150 endorsements plus their get_average_rating lookups,
+    // which is realistic call volume but exceeds the default sandbox CPU budget;
+    // reset it so the test exercises the counting logic, not gas accounting.
+    env.budget().reset_unlimited();
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    let target = Address::generate(&env);
+    let skill = String::from_str(&env, "Rust");
+
+    // Endorse with more addresses than MAX_ENDORSERS_COUNTED (30); each
+    // contributes weight 1 (no rating), so an unbounded sum would exceed 30.
+    for _ in 0..45u32 {
+        let e = Address::generate(&env);
+        client.endorse(&e, &target, &skill);
+    }
+
+    assert_eq!(client.get_skill_score(&target, &skill), 30);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // #536 — Stake-Weighted Reputation Tests
 // ─────────────────────────────────────────────────────────────────────────────

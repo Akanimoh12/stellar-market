@@ -3537,6 +3537,52 @@ fn test_top_up_escrow_emits_event() {
     assert_eq!(topic1, symbol_short!("top_up"));
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")] // InvalidAmount
+fn test_top_up_escrow_rejects_zero_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+
+    let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
+    let job_id = contract.create_job(&client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD, &DEFAULT_EXPIRY_LEDGER);
+    contract.fund_job(&job_id, &client, &0, &0);
+
+    env.as_contract(&contract.address, || {
+        let key = crate::DataKey::Job(job_id);
+        let mut job: crate::Job = env.storage().persistent().get(&key).unwrap();
+        job.total_amount = 1500;
+        env.storage().persistent().set(&key, &job);
+    });
+
+    contract.top_up_escrow(&client, &job_id, &0_i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")] // InvalidAmount
+fn test_top_up_escrow_rejects_negative_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+
+    let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
+    let job_id = contract.create_job(&client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD, &DEFAULT_EXPIRY_LEDGER);
+    contract.fund_job(&job_id, &client, &0, &0);
+
+    env.as_contract(&contract.address, || {
+        let key = crate::DataKey::Job(job_id);
+        let mut job: crate::Job = env.storage().persistent().get(&key).unwrap();
+        job.total_amount = 1500;
+        env.storage().persistent().set(&key, &job);
+    });
+
+    contract.top_up_escrow(&client, &job_id, &-100_i128);
+}
+
 // ============================================================
 // TOKEN ALLOWLIST TESTS
 // ============================================================
@@ -3576,6 +3622,20 @@ fn test_add_allowed_token_non_admin_fails() {
     // freelancer is not a signer — should fail with NotAdmin (#16)
     let new_token = Address::generate(&env);
     contract.add_allowed_token(&freelancer, &new_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")] // ContractPaused
+fn test_add_allowed_token_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract, _client, _freelancer, _token, admin) = setup_test(&env);
+
+    pause_escrow(&env, &contract, &admin);
+
+    // Adding a token while paused should be rejected, same as remove_allowed_token (#989)
+    let new_token = Address::generate(&env);
+    contract.add_allowed_token(&admin, &new_token);
 }
 
 #[test]
@@ -3628,6 +3688,20 @@ fn test_remove_allowed_token_non_admin_fails() {
     // freelancer is not a signer — should fail with NotAdmin (#16)
     let new_token = Address::generate(&env);
     contract.remove_allowed_token(&freelancer, &new_token);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")] // ContractPaused
+fn test_remove_allowed_token_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract, _client, _freelancer, _token, admin) = setup_test(&env);
+
+    let new_token = Address::generate(&env);
+    contract.add_allowed_token(&admin, &new_token);
+
+    pause_escrow(&env, &contract, &admin);
+    contract.remove_allowed_token(&admin, &new_token);
 }
 
 #[test]
@@ -6091,6 +6165,43 @@ fn test_create_multi_token_job_basic() {
     assert_eq!(job.milestones.len(), 2);
     assert_eq!(job.milestones.get(0).unwrap().token, None);
     assert_eq!(job.milestones.get(1).unwrap().token, Some(token_b));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn test_create_multi_token_job_rejects_self_employment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let escrow = EscrowContractClient::new(&env, &contract_id);
+
+    let same_addr = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    StellarAssetClient::new(&env, &token_a).mint(&same_addr, &1000);
+
+    let signers = vec![&env, admin.clone()];
+    escrow.initialize(&signers, &1, &treasury, &0, &604800);
+    escrow.add_allowed_token(&admin, &token_a);
+
+    let milestones: Vec<(soroban_sdk::String, i128, u64, Option<Address>)> = vec![
+        &env,
+        (String::from_str(&env, "Phase 1"), 300_i128, JOB_DEADLINE, None),
+    ];
+
+    // client == freelancer should be rejected, same as create_job (#988)
+    escrow.create_multi_token_job(
+        &same_addr,
+        &same_addr,
+        &token_a,
+        &milestones,
+        &(JOB_DEADLINE + 10),
+        &GRACE_PERIOD,
+        &(env.ledger().sequence() + DEFAULT_EXPIRY_LEDGER),
+    );
 }
 
 #[test]
