@@ -2756,6 +2756,118 @@ fn test_complete_job_wrong_status() {
     escrow.complete_job(&job_id, &client);
 }
 
+/// Regression test for issue #995: complete_job must emit per-token events
+/// for multi-token jobs so indexers can accurately track all fee/payment amounts.
+#[test]
+fn test_complete_job_multi_token_emits_per_token_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let escrow = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let fee_bps: u32 = 500; // 5%
+    
+    escrow.initialize(&vec![&env, admin.clone()], &1, &treasury, &fee_bps, &604800u64);
+
+    let client_addr = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+
+    // Create two different tokens
+    let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    escrow.add_allowed_token(&admin, &token_a);
+    escrow.add_allowed_token(&admin, &token_b);
+
+    // Create multi-token job:
+    // - Milestone 0: 1000 in token_a (default)
+    // - Milestone 1: 2000 in token_b (explicit)
+    // - Milestone 2: 500 in token_a (default)
+    let milestones: Vec<(soroban_sdk::String, i128, u64, Option<Address>)> = vec![
+        &env,
+        (String::from_str(&env, "Task 1"), 1000_i128, 2000_u64, None),
+        (String::from_str(&env, "Task 2"), 2000_i128, 2500_u64, Some(token_b.clone())),
+        (String::from_str(&env, "Task 3"), 500_i128, 3000_u64, None),
+    ];
+
+    let job_id = escrow.create_multi_token_job(
+        &client_addr,
+        &freelancer,
+        &token_a,
+        &milestones,
+        &5000_u64,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+
+    // Fund the job
+    let total_token_a = 1000 + 500; // 1500
+    let total_token_b = 2000;
+
+    StellarAssetClient::new(&env, &token_a).mint(&client_addr, &total_token_a);
+    StellarAssetClient::new(&env, &token_b).mint(&client_addr, &total_token_b);
+
+    escrow.fund_job(&job_id, &client_addr, &0_i128, &0_u32);
+
+    // Submit and approve all milestones
+    for idx in 0..3 {
+        escrow.submit_milestone(&job_id, &idx, &freelancer);
+        escrow.approve_milestone(&job_id, &idx, &client_addr);
+    }
+
+    // Complete the job
+    escrow.complete_job(&job_id, &client_addr);
+
+    // Calculate expected amounts per token
+    // Token A: milestone 0 (1000) + milestone 2 (500) = 1500
+    let token_a_fee = (1500 * fee_bps as i128) / 10_000; // 75
+    let token_a_freelancer = 1500 - token_a_fee; // 1425
+
+    // Token B: milestone 1 (2000)
+    let token_b_fee = (2000 * fee_bps as i128) / 10_000; // 100
+    let token_b_freelancer = 2000 - token_b_fee; // 1900
+
+    // Verify actual token transfers match expected amounts
+    let token_a_client = TokenClient::new(&env, &token_a);
+    let token_b_client = TokenClient::new(&env, &token_b);
+
+    assert_eq!(token_a_client.balance(&treasury), token_a_fee);
+    assert_eq!(token_a_client.balance(&freelancer), token_a_freelancer);
+    assert_eq!(token_b_client.balance(&treasury), token_b_fee);
+    assert_eq!(token_b_client.balance(&freelancer), token_b_freelancer);
+
+    // Verify per-token events were emitted (2 fee_taken + 2 pmt_released)
+    let events = env.events().all();
+    
+    let mut fee_taken_count = 0;
+    let mut pmt_released_count = 0;
+
+    for event in events.iter() {
+        // Check if this is one of our escrow contract events
+        // events from escrow contract have at least 2 topics
+        if event.0 == contract_id && event.1.len() >= 2 {
+            let topic0: Symbol = event.1.get(0).unwrap().into_val(&env);
+            let topic1: Symbol = event.1.get(1).unwrap().into_val(&env);
+
+            if topic0 == symbol_short!("escrow") {
+                if topic1 == Symbol::new(&env, "fee_taken") {
+                    fee_taken_count += 1;
+                } else if topic1 == Symbol::new(&env, "pmt_released") {
+                    pmt_released_count += 1;
+                }
+            }
+        }
+    }
+
+    // Should emit one event per token for each event type
+    assert_eq!(fee_taken_count, 2, "Should emit 2 fee_taken events (one per token)");
+    assert_eq!(pmt_released_count, 2, "Should emit 2 pmt_released events (one per token)");
+}
+
 #[test]
 fn test_fee_taken_event_emitted() {
     let env = Env::default();
