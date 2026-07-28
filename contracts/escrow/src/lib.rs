@@ -3525,6 +3525,7 @@ impl EscrowContract {
         job_id: u64,
     ) -> Result<(), EscrowError> {
         bump_escrow_ttl(&env, job_id);
+        require_not_paused(&env)?;
         caller.require_auth();
 
         // 1. Load job
@@ -3583,6 +3584,7 @@ impl EscrowContract {
         job_id: u64,
     ) -> Result<(), EscrowError> {
         bump_escrow_ttl(&env, job_id);
+        require_not_paused(&env)?;
         caller.require_auth();
 
         // Validate job exists.
