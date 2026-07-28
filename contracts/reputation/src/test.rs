@@ -1492,6 +1492,24 @@ fn test_reputation_multisig_flow() {
 }
 
 #[test]
+fn test_remove_signer_not_found_errors() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+
+    let signer1 = Address::generate(&env);
+    let signer2 = Address::generate(&env);
+    client.initialize(&vec![&env, signer1.clone(), signer2.clone()], &1, &0);
+
+    let not_a_signer = Address::generate(&env);
+    let result =
+        client.try_propose_admin_action(&signer1, &AdminAction::RemoveSigner(not_a_signer));
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_reputation_slash_stake_multisig() {
     let env = Env::default();
     env.mock_all_auths();
