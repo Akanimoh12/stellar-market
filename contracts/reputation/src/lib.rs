@@ -908,9 +908,14 @@ impl ReputationContract {
     }
 
     /// Set configuration for the referral bonus (multi-sig only)
-    pub fn set_referral_bonus(env: Env, bonus: u64) -> Result<(), ReputationError> {
-        if env.current_contract_address() != env.current_contract_address() {
-            return Err(ReputationError::Unauthorized);
+    pub fn set_referral_bonus(
+        env: Env,
+        signer: Address,
+        bonus: u64,
+    ) -> Result<(), ReputationError> {
+        signer.require_auth();
+        if !is_signer(&env, &signer) {
+            return Err(ReputationError::NotAdmin);
         }
         env.storage()
             .instance()
@@ -1295,8 +1300,10 @@ impl ReputationContract {
                 total_score: 0,
                 total_weight: 0,
                 review_count: 0,
-                last_updated_ts: 0,
+                last_updated_ts: env.ledger().timestamp() as u32,
             });
+
+        apply_lazy_decay(&env, &mut reputation);
 
         if score_change > 0 {
             reputation.total_score = reputation.total_score.saturating_add(score_change as u64);
@@ -1304,6 +1311,7 @@ impl ReputationContract {
             reputation.total_score = reputation.total_score.saturating_sub((-score_change) as u64);
         }
 
+        reputation.last_updated_ts = env.ledger().timestamp() as u32;
         env.storage().persistent().set(&rep_key, &reputation);
         bump_reputation_ttl(&env, &user);
 
@@ -1809,6 +1817,13 @@ impl ReputationContract {
             return Err(ReputationError::NotAdmin);
         }
         env.storage().instance().set(&DataKey::StakeTiers, &tiers);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("reput"), Symbol::new(&env, "tiers_set")),
+            (admin, tiers.clone()),
+        );
+
         Ok(())
     }
 
@@ -2729,5 +2744,54 @@ mod tests {
 
         // Call without being a registered signer — should panic with NotAdmin
         client.admin_remove_review(&non_admin, &reviewee, &0);
+    }
+
+    #[test]
+    fn test_dispute_outcome_decay_behavior() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        // Initialize with default decay rate of 10% (10u32)
+        client.initialize(&vec![&env, admin.clone()], &1, &10);
+
+        let dispute_contract = Address::generate(&env);
+        client.set_dispute_contract(&admin, &dispute_contract);
+
+        let user = Address::generate(&env);
+
+        // 1. New user has their first reputation event via dispute outcome.
+        // Timestamp is 500,000.
+        env.ledger().with_mut(|l| l.timestamp = 500_000);
+        client.apply_dispute_outcome(&user, &DisputeOutcome::Won);
+
+        // Verify the user's reputation was created, total_score = 50, and last_updated_ts is 500,000.
+        let rep_before: UserReputation = env.as_contract(&contract_id, || {
+            env.storage().persistent()
+                .get(&DataKey::Reputation(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(rep_before.total_score, 50);
+        assert_eq!(rep_before.last_updated_ts, 500_000);
+
+        // 2. Advance time by 1 year (31,536,000 seconds) so that 10% decay applies.
+        env.ledger().with_mut(|l| l.timestamp = 500_000 + 31_536_000);
+
+        // Perform an unrelated action or a second dispute outcome to trigger lazy decay.
+        // We will call apply_dispute_outcome with Won (+50) again.
+        // With 10% decay, the original 50 score should decay to 45.
+        // Then +50 is added, resulting in 95.
+        client.apply_dispute_outcome(&user, &DisputeOutcome::Won);
+
+        let rep_after: UserReputation = env.as_contract(&contract_id, || {
+            env.storage().persistent()
+                .get(&DataKey::Reputation(user.clone()))
+                .unwrap()
+        });
+        assert_eq!(rep_after.total_score, 95);
+        assert_eq!(rep_after.last_updated_ts, 500_000 + 31_536_000);
     }
 }
