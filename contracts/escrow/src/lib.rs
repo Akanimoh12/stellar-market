@@ -2514,6 +2514,17 @@ impl EscrowContract {
             return Err(EscrowError::InvalidPartialAmount);
         }
 
+        let sub_check_key = DataKey::SubAssignment(job_id, milestone_index);
+        if let Some(sub) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, SubAssignment>(&sub_check_key)
+        {
+            if sub.status == SubAssignmentStatus::Active {
+                return Err(EscrowError::InvalidStatus);
+            }
+        }
+
         // Release partial payment to freelancer using the milestone's own token.
         let ms_token = resolve_milestone_token(&milestone, &job);
         token::Client::new(&env, &ms_token).transfer(
@@ -4024,6 +4035,10 @@ impl EscrowContract {
             return Err(EscrowError::Unauthorized);
         }
 
+        if sub_freelancer == freelancer {
+            return Err(EscrowError::Unauthorized);
+        }
+
         require_state_funded_or_in_progress(&job)?;
 
         let milestone = job
@@ -4115,6 +4130,7 @@ impl EscrowContract {
             .ok_or(EscrowError::MilestoneNotFound)?;
 
         if milestone.status == MilestoneStatus::Submitted
+            || milestone.status == MilestoneStatus::PartiallyPaid
             || milestone.status == MilestoneStatus::Approved
         {
             return Err(EscrowError::InvalidStatus);
