@@ -586,7 +586,13 @@ router.patch(
         typeof overrideDisputeSchema
       >;
 
-      const dispute = await prisma.dispute.findUnique({ where: { id } });
+      const dispute = await prisma.dispute.findUnique({
+        where: { id },
+        include: {
+          client: { select: { walletAddress: true } },
+          freelancer: { select: { walletAddress: true } },
+        },
+      });
       if (!dispute) {
         res.status(404).json({ error: "Dispute not found" });
         return;
@@ -605,6 +611,17 @@ router.patch(
         outcome,
         status,
       });
+
+      if (dispute.client?.walletAddress) {
+        await ReputationCacheService.invalidateCache(
+          dispute.client.walletAddress,
+        );
+      }
+      if (dispute.freelancer?.walletAddress) {
+        await ReputationCacheService.invalidateCache(
+          dispute.freelancer.walletAddress,
+        );
+      }
 
       res.json({
         message: "Dispute outcome overridden successfully",
@@ -973,7 +990,13 @@ router.patch(
       const id = req.params.id as string;
       const { outcome, status } = overrideDisputeSchema.parse(req.body);
 
-      const dispute = await prisma.dispute.findUnique({ where: { id } });
+      const dispute = await prisma.dispute.findUnique({
+        where: { id },
+        include: {
+          client: { select: { walletAddress: true } },
+          freelancer: { select: { walletAddress: true } },
+        },
+      });
       if (!dispute) {
         res.status(404).json({ error: "Dispute not found" });
         return;
@@ -992,6 +1015,17 @@ router.patch(
         outcome,
         status,
       });
+
+      if (dispute.client?.walletAddress) {
+        await ReputationCacheService.invalidateCache(
+          dispute.client.walletAddress,
+        );
+      }
+      if (dispute.freelancer?.walletAddress) {
+        await ReputationCacheService.invalidateCache(
+          dispute.freelancer.walletAddress,
+        );
+      }
 
       res.json({
         message: "Dispute outcome overridden successfully",
