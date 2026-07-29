@@ -185,7 +185,11 @@ describe("fetchOnChainPayments — shared Redis cache across backend instances",
   });
 
   it("falls back to a direct Horizon fetch (not a crash) when Redis is unreachable", async () => {
-    const RedisClient = (jest.requireMock("../../lib/redis") as { default: any }).default;
+    const RedisClient = (
+      jest.requireMock("../../lib/redis") as {
+        default: { isRedisConnected: jest.Mock; connect: jest.Mock };
+      }
+    ).default;
     RedisClient.isRedisConnected.mockReturnValue(false);
     RedisClient.connect.mockRejectedValueOnce(new Error("ECONNREFUSED"));
 
@@ -318,6 +322,6 @@ describe("flagDbOnlyForReview — never auto-deletes", () => {
     expect(mockTransaction.upsert).not.toHaveBeenCalled();
     // No delete method exists on the mock at all — flagging must never call
     // one, so there is nothing wired up for it to reach.
-    expect((mockTransaction as any).delete).toBeUndefined();
+    expect((mockTransaction as Record<string, unknown>).delete).toBeUndefined();
   });
 });
