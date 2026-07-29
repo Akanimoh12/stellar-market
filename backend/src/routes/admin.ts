@@ -679,7 +679,7 @@ router.get(
           totalPages: Math.ceil(total / limit),
         },
       });
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   },
@@ -1089,7 +1089,7 @@ router.get(
           totalPages: Math.ceil(total / limit),
         },
       });
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   },
@@ -1268,7 +1268,7 @@ router.post(
       await logAdminAction(req.userId!, "DISMISS_JOB_FLAG", id);
 
       res.json({ message: "Job flag dismissed successfully", job: updatedJob });
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   },
@@ -1323,7 +1323,7 @@ router.post(
       });
 
       res.json({ message: "User suspended successfully", user: updatedUser });
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   },
@@ -1357,7 +1357,7 @@ router.post(
       await logAdminAction(req.userId!, "UNSUSPEND_USER", id);
 
       res.json({ message: "User restored successfully", user: updatedUser });
-    } catch (error) {
+    } catch {
       res.status(500).json({ error: "Internal server error" });
     }
   },
