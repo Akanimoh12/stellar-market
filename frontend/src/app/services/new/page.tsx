@@ -13,7 +13,7 @@ const STORAGE_KEY = "service-form-draft";
 
 export default function NewServicePage() {
   const router = useRouter();
-  const { user, isLoading } = useAuth();
+  const { user, isLoading, token } = useAuth();
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -120,8 +120,6 @@ export default function NewServicePage() {
     setErrors({});
 
     try {
-      const token = localStorage.getItem("token");
-      
       await axios.post(
         `${API_URL}/services`,
         {

@@ -226,7 +226,14 @@ export default function FilterSidebar({
             type="number"
             placeholder="Min"
             value={filters.minBudget}
-            onChange={(e) => updateFilter("minBudget", e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              if (val && filters.maxBudget && Number(val) > Number(filters.maxBudget)) {
+                updateFilter("minBudget", filters.maxBudget);
+              } else {
+                updateFilter("minBudget", val);
+              }
+            }}
             className="input-field text-sm"
             min={0}
           />
@@ -236,7 +243,14 @@ export default function FilterSidebar({
             type="number"
             placeholder="Max"
             value={filters.maxBudget}
-            onChange={(e) => updateFilter("maxBudget", e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              if (val && filters.minBudget && Number(val) < Number(filters.minBudget)) {
+                updateFilter("maxBudget", filters.minBudget);
+              } else {
+                updateFilter("maxBudget", val);
+              }
+            }}
             className="input-field text-sm"
             min={0}
           />
