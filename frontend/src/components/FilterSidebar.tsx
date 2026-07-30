@@ -217,7 +217,12 @@ export default function FilterSidebar({
         </div>
       </FilterSection>
 
-      {/* Budget Range */}
+      {/* Budget Range
+           The min/max budget inputs auto-clamp to prevent a contradictory
+           range (e.g. Min = 5000, Max = 100) which would silently return
+           zero results from the API.  If the user enters a min above the
+           current max, min is clamped down to max; if they enter a max
+           below the current min, max is raised to min (issue #954).     */}
       <FilterSection title="Budget (XLM)">
         <div className="flex gap-2">
           <label htmlFor="filter-budget-min" className="sr-only">Minimum budget</label>

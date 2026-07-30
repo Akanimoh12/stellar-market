@@ -120,6 +120,8 @@ export default function JobDetailClient() {
   } = useQuery<Job | null>({
     queryKey: ["job", id],
     queryFn: async () => {
+      // Read the auth token with the correct key (stellarmarket_jwt) falling
+      // back to the legacy "token" key for backward compatibility (#958).
       const token = localStorage.getItem("stellarmarket_jwt") ?? localStorage.getItem("token");
       const res = await axios.get(`${API_URL}/jobs/${id}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},

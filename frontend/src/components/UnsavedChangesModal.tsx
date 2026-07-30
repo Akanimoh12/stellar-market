@@ -11,6 +11,9 @@ type Props = {
 };
 
 export default function UnsavedChangesModal({ isOpen, onConfirm, onCancel }: Props) {
+  // Create a ref to the dialog container so useFocusTrap can restrict
+  // keyboard focus within the modal while it is open, preventing users
+  // from tabbing to elements behind the overlay (issues #966).
   const modalRef = useRef<HTMLDivElement>(null);
   useFocusTrap(modalRef, { open: isOpen, onClose: onCancel });
 

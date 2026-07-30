@@ -13,6 +13,10 @@ const STORAGE_KEY = "service-form-draft";
 
 export default function NewServicePage() {
   const router = useRouter();
+  // Destructure `token` from useAuth() so the Authorization header uses the
+  // correct key (stellarmarket_jwt) rather than reading the non-existent
+  // localStorage key "token" (issue #950).  token is null when not logged in,
+  // which matches the original guard behaviour.
   const { user, isLoading, token } = useAuth();
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
