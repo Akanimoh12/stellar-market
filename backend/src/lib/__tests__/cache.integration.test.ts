@@ -37,7 +37,11 @@ jest.mock("../redis", () => {
     on: jest.fn(),
     connect: jest.fn(),
     quit: jest.fn(),
+    duplicate: jest.fn(),
   };
+  // recommendation-queue.service.ts duplicates the shared client into a
+  // dedicated blocking-safe connection for its BullMQ Worker.
+  mockRedis.duplicate.mockReturnValue(mockRedis);
 
   return {
     __esModule: true,

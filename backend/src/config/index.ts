@@ -92,6 +92,14 @@ export const config = {
     pass: process.env.SMTP_PASS || "",
     from: process.env.SMTP_FROM || "noreply@stellarmarket.io",
   },
+  email: {
+    // "brevo" sends via Brevo's HTTP API (just an API key, no SMTP login);
+    // anything else falls back to the smtp block above via nodemailer.
+    provider: process.env.EMAIL_SERVICE_PROVIDER || "smtp",
+    apiKey: process.env.EMAIL_SERVICE_API_KEY || "",
+    fromAddress: process.env.EMAIL_FROM_ADDRESS || process.env.SMTP_FROM || "noreply@stellarmarket.io",
+    fromName: process.env.EMAIL_FROM_NAME || "StellarMarket",
+  },
   vapidPublicKey: process.env.VAPID_PUBLIC_KEY || "",
   vapidPrivateKey: process.env.VAPID_PRIVATE_KEY || "",
   vapidSubject: process.env.VAPID_SUBJECT || "mailto:admin@stellarmarket.io",

@@ -67,6 +67,12 @@ const mockRedisInstance = {
   disconnect: jest.fn(),
   status: "ready",
 };
+// notification-queue.ts and recommendation-queue.service.ts each duplicate the
+// shared client into a dedicated blocking-safe connection for their BullMQ
+// Worker; the mock doesn't need a distinct connection, so hand back itself.
+(mockRedisInstance as unknown as { duplicate: jest.Mock }).duplicate = jest
+  .fn()
+  .mockReturnValue(mockRedisInstance);
 
 jest.mock("./src/lib/redis", () => ({
   __esModule: true,

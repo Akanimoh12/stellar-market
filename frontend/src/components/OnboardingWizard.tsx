@@ -143,8 +143,9 @@ function StepWallet({
   setWalletAddress,
 }: StepProps & { walletAddress: string | null; setWalletAddress: (a: string | null) => void }) {
   const [state, setState] = useState<WalletState>("idle");
+  const [linkError, setLinkError] = useState<string | null>(null);
   const { token, updateUser } = useAuth();
-  const { connect, address: walletContextAddress, isFreighterInstalled } = useWallet();
+  const { connect, bindWallet, address: walletContextAddress, isFreighterInstalled } = useWallet();
 
   // Sync WalletContext address into local state when it changes (e.g. after
   // connecting via the shared connect() flow).
@@ -162,6 +163,7 @@ function StepWallet({
     }
 
     setState("connecting");
+    setLinkError(null);
     try {
       // Delegate to the shared WalletContext connect flow so the navbar and
       // every other consumer stay in sync automatically.
@@ -172,25 +174,32 @@ function StepWallet({
         return;
       }
 
+      if (!token) {
+        setState("idle");
+        return;
+      }
+
+      // Bind via the signed challenge/verify flow — the same one Settings
+      // uses — rather than just writing the address, so the server actually
+      // has proof this account controls the key before treating it as linked.
+      const result = await bindWallet(token);
+      if (!result.success) {
+        setLinkError(result.error ?? "Failed to link wallet.");
+        setState("idle");
+        return;
+      }
+      if (result.token) {
+        localStorage.setItem("stellarmarket_jwt", result.token);
+      }
+
       setWalletAddress(publicKey);
       setState("connected");
-
-      // Persist wallet address to user profile
-      try {
-        await axios.patch(
-          `${API}/users/me`,
-          { walletAddress: publicKey },
-          { headers: { Authorization: `Bearer ${token}` } },
-        );
-        updateUser({ walletAddress: publicKey });
-      } catch {
-        // Profile update failure is non-blocking — address is already in WalletContext
-      }
+      updateUser({ walletAddress: publicKey });
     } catch {
       // User rejected or error occurred
       setState("idle");
     }
-  }, [connect, isFreighterInstalled, token, updateUser, setWalletAddress]);
+  }, [connect, bindWallet, isFreighterInstalled, token, updateUser, setWalletAddress]);
 
   const truncate = (addr: string) => `${addr.slice(0, 6)}…${addr.slice(-4)}`;
 
@@ -216,6 +225,12 @@ function StepWallet({
           >
             Get Freighter <ExternalLink size={12} />
           </a>
+        </div>
+      )}
+
+      {linkError && (
+        <div className="rounded-lg bg-theme-error/10 border border-theme-error/30 p-3 mb-4 text-sm text-theme-error">
+          {linkError}
         </div>
       )}
 

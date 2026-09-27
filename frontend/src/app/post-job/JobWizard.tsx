@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import {
   Plus,
@@ -179,13 +179,15 @@ export default function JobWizard() {
   });
 
   const milestones = watch("milestones");
-  const totalBudget = useMemo(
-    () =>
-      milestones.reduce(
-        (sum, m) => sum + (Number.parseFloat(m.amount) || 0),
-        0,
-      ),
-    [milestones],
+  // Deliberately not memoized: watch() isn't guaranteed to return a new array
+  // reference on every render it's read in, so a useMemo keyed on [milestones]
+  // could (and did) compare equal by reference against stale content and skip
+  // recomputing — silently showing an old total after editing a milestone
+  // amount. The reduce itself is cheap enough that recomputing on every
+  // render costs nothing.
+  const totalBudget = milestones.reduce(
+    (sum, m) => sum + (Number.parseFloat(m.amount) || 0),
+    0,
   );
 
   // Save draft to localStorage. Skipped once the job is published so we don't
@@ -226,7 +228,13 @@ export default function JobWizard() {
   }
 
   const handleNext = async () => {
-    const isValid = await trigger();
+    // Validate only step 1's own fields — trigger() with no arguments
+    // validates the full merged schema, including step 2's "at least one
+    // milestone" requirement, which can never be satisfied yet since the
+    // milestones screen hasn't been reached. That silently failed validation
+    // and blocked the Next button with no visible error (nothing on this
+    // step renders a milestones error).
+    const isValid = await trigger(["title", "description", "category", "deadline"]);
     if (isValid) {
       setCurrentStep(2);
     }
@@ -289,8 +297,19 @@ export default function JobWizard() {
       router.push(`/jobs/${res.data.id}`);
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
+        // The validation middleware sends a generic top-level "Validation
+        // failed" plus a detailed `errors: [{field, message}]` array — using
+        // only the generic message left failures like "skills: at least one
+        // skill is required" completely undiagnosable from the UI.
+        const fieldErrors = err.response?.data?.errors as
+          | { field: string; message: string }[]
+          | undefined;
+        const detail = fieldErrors?.length
+          ? fieldErrors.map((e) => (e.field ? `${e.field}: ${e.message}` : e.message)).join("; ")
+          : undefined;
         setError(
-          err.response?.data?.error ||
+          detail ||
+            err.response?.data?.error ||
             err.response?.data?.message ||
             "Failed to post job. Your draft is saved — please try again.",
         );

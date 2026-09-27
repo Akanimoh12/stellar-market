@@ -14,6 +14,29 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+/** Sends via Brevo's transactional email HTTP API — auth is just the API key, no SMTP login. */
+async function sendViaBrevo(params: { to: string; subject: string; html: string }): Promise<void> {
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      "api-key": config.email.apiKey,
+    },
+    body: JSON.stringify({
+      sender: { name: config.email.fromName, email: config.email.fromAddress },
+      to: [{ email: params.to }],
+      subject: params.subject,
+      htmlContent: params.html,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Brevo API error (${response.status}): ${body}`);
+  }
+}
+
 export class EmailService {
   static generateUnsubscribeToken(userId: string): string {
     return jwt.sign(
@@ -163,12 +186,16 @@ export class EmailService {
     html: string;
   }): Promise<void> {
     try {
-      await transporter.sendMail({
-        from: config.smtp.from,
-        to: params.to,
-        subject: params.subject,
-        html: params.html,
-      });
+      if (config.email.provider === "brevo") {
+        await sendViaBrevo(params);
+      } else {
+        await transporter.sendMail({
+          from: config.smtp.from,
+          to: params.to,
+          subject: params.subject,
+          html: params.html,
+        });
+      }
     } catch (error) {
       logger.error(
         { err: error, to: params.to, subject: params.subject },

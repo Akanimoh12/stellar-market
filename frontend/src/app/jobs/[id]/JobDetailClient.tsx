@@ -167,6 +167,17 @@ export default function JobDetailClient({
     },
     initialData: initialJob ?? undefined,
     staleTime: 60_000,
+    // initialJob comes from an unauthenticated server-side fetch (SSR can't
+    // read the browser's token), which is deliberately a reduced shape —
+    // missing deadline/status/skills/etc. staleTime alone let that reduced
+    // data sit there as "fresh" for a full 60s (even across a hard refresh,
+    // since a fresh SSR fetch just re-seeds the same reduced shape), so a
+    // logged-in viewer's own authenticated, complete fetch never ran and
+    // e.g. the Apply button stayed hidden because job.status looked missing.
+    // Forcing a refetch on every mount doesn't defeat the point of
+    // initialData (instant first paint) — it just stops that first paint
+    // from being mistaken for the real, authenticated answer.
+    refetchOnMount: "always",
   });
 
   const {
@@ -285,6 +296,22 @@ export default function JobDetailClient({
   const withdrawConfirmRef = useRef<HTMLDivElement>(null);
   useFocusTrap(withdrawConfirmRef, { open: withdrawConfirmOpen, onClose: () => setWithdrawConfirmOpen(false) });
   const [withdrawing, setWithdrawing] = useState(false);
+
+  // Accepting an application never syncs the job's budget/milestones to the
+  // freelancer's bid — nothing prevents a client from accidentally accepting
+  // a bid that doesn't match what the job actually pays out. Surface that
+  // mismatch before the accept goes through instead of leaving it to be
+  // discovered mid-contract.
+  const [acceptBidMismatch, setAcceptBidMismatch] = useState<{
+    appId: string;
+    freelancerName: string;
+    bidAmount: number;
+  } | null>(null);
+  const acceptBidMismatchRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(acceptBidMismatchRef, {
+    open: !!acceptBidMismatch,
+    onClose: () => setAcceptBidMismatch(null),
+  });
   const [actioningApp, setActioningApp] = useState<string | null>(null);
   const [proposeRevisionOpen, setProposeRevisionOpen] = useState(false);
   const [recentlyApprovedMilestoneId, setRecentlyApprovedMilestoneId] = useState<
@@ -941,13 +968,19 @@ export default function JobDetailClient({
   const revisionInitialMilestones =
     useMemo((): ProposeRevisionMilestoneInput[] => {
       if (!job?.milestones?.length) return [];
-      return job.milestones.map((m) => ({
-        title: m.title,
-        amount: m.amount,
-        deadline: m.contractDeadline
-          ? new Date(m.contractDeadline).toISOString()
-          : new Date(job.deadline).toISOString(),
-      }));
+      // The server-rendered `initialJob` this hydrates from is fetched
+      // without auth (SSR has no access to the client's token), so it can
+      // legitimately be the reduced public shape — which omits `deadline` —
+      // for the brief window before the authenticated client-side refetch
+      // replaces it. new Date(undefined).toISOString() throws and crashed
+      // the whole page; skip a milestone that has no valid date to fall
+      // back to instead.
+      return job.milestones.flatMap((m) => {
+        const raw = m.contractDeadline ?? job.deadline;
+        const parsed = raw ? new Date(raw) : null;
+        if (!parsed || Number.isNaN(parsed.getTime())) return [];
+        return [{ title: m.title, amount: m.amount, deadline: parsed.toISOString() }];
+      });
     }, [job]);
 
   const selectedTokenBalance = useMemo(() => {
@@ -1150,7 +1183,7 @@ export default function JobDetailClient({
               >
                 {job.category}
               </Link>
-              {job.skills.map((skill) => (
+              {(job.skills ?? []).map((skill) => (
                 <Link
                   key={skill}
                   href={`/jobs?skills=${encodeURIComponent(skill)}`}
@@ -1403,7 +1436,13 @@ export default function JobDetailClient({
                               <button
                                 disabled={actioningApp === app.id}
                                 onClick={() =>
-                                  void handleApplicationStatus(app.id, "ACCEPTED")
+                                  app.bidAmount !== job.budget
+                                    ? setAcceptBidMismatch({
+                                        appId: app.id,
+                                        freelancerName: app.freelancer.username,
+                                        bidAmount: app.bidAmount,
+                                      })
+                                    : void handleApplicationStatus(app.id, "ACCEPTED")
                                 }
                                 className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-theme-success/10 text-theme-success hover:bg-theme-success/20 transition-colors disabled:opacity-50"
                               >
@@ -1506,59 +1545,64 @@ export default function JobDetailClient({
               </div>
 
               <div className="mt-4 space-y-2">
-                <div className="rounded-xl border border-theme-border bg-theme-bg/60 p-4">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-[10px] uppercase tracking-[0.24em] text-theme-text-muted">
-                        Payment token
-                      </p>
-                      <h4 className="mt-1 text-sm font-semibold text-theme-heading">
-                        Choose your escrow asset
-                      </h4>
+                {/* Only the client ever acts on this — a freelancer has no
+                    business seeing "their" wallet balance weighed against a
+                    "Required" amount they're not the one depositing. */}
+                {isClient && (
+                  <div className="rounded-xl border border-theme-border bg-theme-bg/60 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] uppercase tracking-[0.24em] text-theme-text-muted">
+                          Payment token
+                        </p>
+                        <h4 className="mt-1 text-sm font-semibold text-theme-heading">
+                          Choose your escrow asset
+                        </h4>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-theme-text">
+                        <span className="rounded-full border border-theme-border px-2 py-1">
+                          1 XLM ≈ 1 USDC
+                        </span>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2 text-xs text-theme-text">
+
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {PAYMENT_TOKENS.map((token) => (
+                        <button
+                          key={token}
+                          type="button"
+                          onClick={() => setSelectedPaymentToken(token)}
+                          className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+                            selectedPaymentToken === token
+                              ? "border-stellar-blue bg-stellar-blue/10 text-stellar-blue"
+                              : "border-theme-border bg-theme-card text-theme-text hover:border-stellar-blue hover:text-stellar-blue"
+                          }`}
+                        >
+                          {token}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-theme-text">
+                      <span>
+                        Wallet balance: {selectedTokenBalance.toLocaleString(undefined, {
+                          maximumFractionDigits: 2,
+                        })} {selectedPaymentToken}
+                      </span>
                       <span className="rounded-full border border-theme-border px-2 py-1">
-                        1 XLM ≈ 1 USDC
+                        Required: {selectedTokenAmount.toLocaleString(undefined, {
+                          maximumFractionDigits: 2,
+                        })} {selectedPaymentToken}
                       </span>
                     </div>
-                  </div>
 
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {PAYMENT_TOKENS.map((token) => (
-                      <button
-                        key={token}
-                        type="button"
-                        onClick={() => setSelectedPaymentToken(token)}
-                        className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
-                          selectedPaymentToken === token
-                            ? "border-stellar-blue bg-stellar-blue/10 text-stellar-blue"
-                            : "border-theme-border bg-theme-card text-theme-text hover:border-stellar-blue hover:text-stellar-blue"
-                        }`}
-                      >
-                        {token}
-                      </button>
-                    ))}
+                    {!hasSufficientSelectedTokenBalance && (
+                      <p className="mt-2 text-xs text-theme-error">
+                        Insufficient {selectedPaymentToken} balance for this escrow deposit.
+                      </p>
+                    )}
                   </div>
-
-                  <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-theme-text">
-                    <span>
-                      Wallet balance: {selectedTokenBalance.toLocaleString(undefined, {
-                        maximumFractionDigits: 2,
-                      })} {selectedPaymentToken}
-                    </span>
-                    <span className="rounded-full border border-theme-border px-2 py-1">
-                      Required: {selectedTokenAmount.toLocaleString(undefined, {
-                        maximumFractionDigits: 2,
-                      })} {selectedPaymentToken}
-                    </span>
-                  </div>
-
-                  {!hasSufficientSelectedTokenBalance && (
-                    <p className="mt-2 text-xs text-theme-error">
-                      Insufficient {selectedPaymentToken} balance for this escrow deposit.
-                    </p>
-                  )}
-                </div>
+                )}
 
                 {isClient &&
                   !job.contractJobId &&
@@ -1717,31 +1761,33 @@ export default function JobDetailClient({
               )}
           </div>
 
-          <div className="card">
-            <h3 className="font-semibold text-theme-heading mb-4">
-              About the Client
-            </h3>
-            <div className="flex items-center gap-3 mb-3">
-              <Avatar
-                src={job.client.avatarUrl}
-                alt={job.client.username}
-                size={40}
-              />
-              <div>
-                <div className="font-medium text-theme-heading">
-                  {job.client.username}
+          {!isOwnJob && (
+            <div className="card">
+              <h3 className="font-semibold text-theme-heading mb-4">
+                About the Client
+              </h3>
+              <div className="flex items-center gap-3 mb-3">
+                <Avatar
+                  src={job.client.avatarUrl}
+                  alt={job.client.username}
+                  size={40}
+                />
+                <div>
+                  <div className="font-medium text-theme-heading">
+                    {job.client.username}
+                  </div>
+                  <WalletAddress address={job.client.walletAddress} />
                 </div>
-                <WalletAddress address={job.client.walletAddress} />
               </div>
+              <p className="text-sm text-theme-text mb-4">{job.client.bio}</p>
+              <Link
+                href={`/messages/${job.client.id}-${job.id}`}
+                className="btn-secondary w-full flex items-center justify-center gap-2"
+              >
+                <MessageSquare size={18} /> Message Client
+              </Link>
             </div>
-            <p className="text-sm text-theme-text mb-4">{job.client.bio}</p>
-            <Link
-              href={`/messages/${job.client.id}-${job.id}`}
-              className="btn-secondary w-full flex items-center justify-center gap-2"
-            >
-              <MessageSquare size={18} /> Message Client
-            </Link>
-          </div>
+          )}
         </div>
       </div>
 
@@ -1827,6 +1873,52 @@ export default function JobDetailClient({
                   <Loader2 size={14} className="animate-spin" />
                 ) : null}
                 Withdraw
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {acceptBidMismatch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div ref={acceptBidMismatchRef} className="bg-theme-card border border-theme-border rounded-xl shadow-2xl w-full max-w-md p-6">
+            <h2 className="text-lg font-semibold text-theme-heading mb-2">
+              Bid doesn&apos;t match this job&apos;s budget
+            </h2>
+            <p className="text-sm text-theme-text mb-6">
+              <span className="font-medium text-theme-heading">{acceptBidMismatch.freelancerName}</span>{" "}
+              proposed{" "}
+              <span className="font-medium text-theme-heading">
+                {acceptBidMismatch.bidAmount.toLocaleString()} XLM
+              </span>
+              , but this job&apos;s milestones still total{" "}
+              <span className="font-medium text-theme-heading">{job.budget.toLocaleString()} XLM</span>.
+              Accepting won&apos;t change that — the freelancer will only ever be paid out{" "}
+              {job.budget.toLocaleString()} XLM through this job&apos;s milestones. If you agreed to their
+              rate, message them to confirm before accepting, or update the milestone amounts to match
+              first.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setAcceptBidMismatch(null)}
+                className="btn-secondary"
+                disabled={actioningApp === acceptBidMismatch.appId}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const appId = acceptBidMismatch.appId;
+                  setAcceptBidMismatch(null);
+                  await handleApplicationStatus(appId, "ACCEPTED");
+                }}
+                disabled={actioningApp === acceptBidMismatch.appId}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-theme-success text-white text-sm font-medium hover:bg-theme-success/90 transition-colors disabled:opacity-50"
+              >
+                {actioningApp === acceptBidMismatch.appId ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : null}
+                Accept at {job.budget.toLocaleString()} XLM anyway
               </button>
             </div>
           </div>
