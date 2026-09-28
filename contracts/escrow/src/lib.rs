@@ -1009,6 +1009,22 @@ impl EscrowContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Return the list of registered multisig signers.
+    pub fn get_multisig_signers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiSigSigners)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return the multisig approval threshold (number of signers required to approve an action).
+    pub fn get_multisig_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiSigThreshold)
+            .unwrap_or(0)
+    }
+
     /// Check if the contract is paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
@@ -1052,6 +1068,11 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::DisputeContract, &dispute_contract);
         Ok(())
+    }
+
+    /// Return the registered dispute contract address, if any.
+    pub fn get_dispute_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::DisputeContract)
     }
 
     /// Called by the registered dispute contract to transition a job to the Disputed state
@@ -4572,12 +4593,6 @@ impl EscrowContract {
         if new_deadline <= milestone.deadline {
             return Err(EscrowError::InvalidDeadline);
         }
-
-        // If the business rule requires it, this can be re-enabled to prevent
-        // milestone deadlines from moving beyond the job-level deadline.
-        // if new_deadline > job.job_deadline {
-        //     return Err(EscrowError::InvalidDeadline);
-        // }
 
         milestone.deadline = new_deadline;
         milestones.set(milestone_id, milestone);

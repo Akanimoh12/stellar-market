@@ -1368,6 +1368,25 @@ impl DisputeContract {
         Ok(())
     }
 
+    /// Resolve a dispute by executing the voting outcome.
+    ///
+    /// Computes the final resolution based on arbitrator votes and executes the
+    /// corresponding settlement via the escrow contract, transitioning the dispute
+    /// to its resolved state. Can only be called once voting has closed with a
+    /// decisive majority (or enough votes to break a tie).
+    ///
+    /// # Arguments
+    /// * `dispute_id` — The unique identifier of the dispute to resolve
+    ///
+    /// # Returns
+    /// The new [`DisputeStatus`] of the resolved dispute
+    ///
+    /// # Errors
+    /// * `DisputeNotFound` — if no dispute exists with the given ID
+    /// * `NotInitialized` — if the escrow contract address is not configured
+    /// * `VotingClosed` — if voting has not yet concluded
+    /// * `NotEnoughVotes` — if there are insufficient votes to determine an outcome
+    /// * `ContractPaused` — if the contract is paused
     pub fn resolve_dispute(env: Env, dispute_id: u64) -> Result<DisputeStatus, DisputeError> {
         require_not_paused(&env)?;
 
